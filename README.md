@@ -1,5 +1,40 @@
 # Operations
 
+## Pages
+
+- **Overview**: start here. Vitals for the range you pick, an hourly strip of today's requests,
+  errors, incidents and changes, and a Needs attention list that includes kanban cards stuck
+  waiting on a person. Click any mark on the strip to see what happened in that hour and jump
+  to it on another page.
+- **Topology**: a map of your hosts, their gateways, and the devices and cloud providers that
+  answered their requests, with line width showing where the traffic went. Chips over the map
+  count what is wrong right now. Select a node to see what would stop if it went down, or drag
+  the track under the map to see the fleet as it was at any moment in the window.
+- **Flow**: follows each request from where it came in, through its profile and model, to what
+  actually answered it. Pick any bar to isolate that traffic and see where it came from, where it
+  went, and how much of it failed.
+- **Activity**: a running log of errors, gateways going down and coming back, kanban events, host
+  check changes, merged MRs and model loads, grouped by hour and filtered by kind. Open an entry
+  for its raw lines, or turn on Activity summaries to have each one read as a plain sentence.
+- **Handoffs**: who handed work to whom, one lane per agent, for kanban cards and subagents. Move
+  an open card along without leaving the page: hand it to a profile, schedule it, answer a blocked
+  worker, mark it done or close it.
+- **Trace**: opens a session as a timeline of its model calls and the subagents it started. "Why
+  it took this long" names the longest wait and the calls that ran well past their usual time,
+  measured against similar calls from the week before.
+- **Merge requests**: open and recently merged MRs, who each one is waiting on and for how long,
+  and where its pipeline stands.
+- **Conformance**: checks your projects for leaked keys and tokens, merge conflict markers and
+  hard-coded home directories with no setup, and once you have a standard, your hosts against it.
+  Hand a failing project or host to a profile as a fix card in one step, or fix a host yourself
+  from the command shown.
+- **Notifications**: every alert the page has raised, with an unread count, since Hermes Desktop
+  has no notification center of its own. A new install also finds its setup checklist here.
+
+Links on every page open the same host, model, card or session on another page, already selected.
+
+## How it works
+
 Hermes plugin: an Operations overview. It shows vitals for the chosen window,
 today's hourly strip, what needs attention (including kanban cards waiting on a person:
 blocked or in triage, with the worker's reason and a link to the card in Handoffs), changes and news (merged MRs, model loads),
@@ -23,7 +58,9 @@ as a red share of each bar (the router's own errors carry no entry point and sta
 where its requests came from and went. While one is selected (or opened from a "See its traffic" link) a bar above the chart
 names it with its share of the window; each band shows its traffic in the color of what served it over the rest dimmed, the hourly chart
 shows only its traffic, scaled to its busiest hour, failed counts are red, and
-each other bar counts its requests through it. A link to something with no requests in the window says so and offers
+each other bar counts its requests through it. When some of its requests failed, the panel beside the chart lists what
+failed (the error, where and when) with links to the session in Trace and to the map, and the hourly chart
+draws the failed share in red. A link to something with no requests in the window says so and offers
 the last 7 days; an error in Activity links to its model's traffic. An Activity tab lists errors, gateway state changes,
 kanban task events, host check changes, merged MRs and model loads, grouped by hour and
 filtered by kind; an entry opens to its raw lines. A Handoffs tab shows who handed work to

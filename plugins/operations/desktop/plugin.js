@@ -99,7 +99,7 @@ const useFlow = (hours, start) =>
 const useErrors = (hours, start) =>
   useQuery({
     queryKey: [ID, 'errors', hours, start],
-    queryFn: () => api.rest(`/errors?hours=${hours}&start=${start}`, { timeoutMs: 45_000 }),
+    queryFn: () => api.rest(`/errors?hours=${hours}${start != null ? `&start=${start}` : ''}`, { timeoutMs: 45_000 }),
     refetchInterval: REFRESH_MS
   })
 
@@ -641,33 +641,36 @@ function HourErrors({ start }) {
   const { data, isLoading, isError } = useErrors(1, start)
   const groups = data?.groups || []
   const total = groups.reduce((n, g) => n + g.count, 0)
-  const at = Math.min(start + 3600, Date.now() / 1000)
   return drawerPart('e', isLoading ? 'Errors this hour' : `Errors this hour (${total})`,
     isError || data?.errors?.errors ? drawerText('x', `Could not load them: ${data?.errors?.errors || 'the backend did not respond'}.`)
     : isLoading ? jsx(Skeleton, { className: 'h-16 w-full' })
-    : jsx('div', {
-        className: 'divide-y divide-(--ui-stroke-secondary)',
-        children: groups.map((g, i) => jsxs('div', { key: i, className: 'grid gap-1 py-2', children: [
-          jsxs('div', { className: 'flex flex-wrap items-center gap-2 text-[0.6875rem] text-(--ui-text-quaternary)', children: [
-            jsx(KindBox, { color: TONE.bad, children: plural(g.count, 'error') }),
-            jsx('span', { className: 'font-medium text-(--ui-text-primary)', children: `${g.platform ? `${g.platform} calls` : 'router'} on ${g.host || 'unknown host'}` }),
-            jsx('span', { className: 'ml-auto tabular-nums', style: { fontFamily: MONO }, children: g.first === g.last ? fmtClock(g.last) : `${fmtClock(g.first)} to ${fmtClock(g.last)}` })
-          ] }),
-          jsx('div', { style: { fontFamily: MONO, fontSize: 12, color: TONE.bad, overflowWrap: 'anywhere' }, children: g.error || `${g.event} failed` }),
-          jsx('div', { style: { fontSize: 12.5, color: DIM }, children: [
-            g.profile && `profile ${g.profile}`, g.model && `model ${g.model}`, g.served && `served by ${g.served}`,
-            g.sessions.length ? plural(g.sessions.length, 'session') : 'no session'].filter(Boolean).join(' · ') }),
-          jsxs('div', { className: 'flex flex-wrap gap-3', children: [
-            g.sessions.length ? jsx(GoLink, { key: 't', tab: 'trace', sel: g.sessions[0], hours: 1, start,
-              children: g.sessions.length > 1 ? `Open the newest of ${g.sessions.length} sessions in Trace` : 'Open the session in Trace' }) : null,
-            // only a client's failed calls (with a platform) are counted in Flow
-            g.platform && g.model ? jsx(GoLink, { key: 'f', tab: 'flow', sel: `model:${g.model}`, hours: 1, start, children: 'Show the model in Flow' }) : null,
-            g.host ? jsx(GoLink, { key: 'm', tab: 'topology', sel: g.platform && g.profile ? `p:${g.host}:${g.profile}` : `h:${g.host}`, at, start,
-              note: `${plural(g.count, 'error')}, ${g.platform ? `${g.platform} calls` : 'router'} on ${g.host}: ${g.error || `${g.event} failed`}`,
-              children: g.platform && g.profile ? `Show ${g.profile} on ${g.host} on the map` : 'Show the host on the map' }) : null
-          ] })
-        ] }))
-      }))
+    : jsx('div', { className: 'divide-y divide-(--ui-stroke-secondary)', children: errorRows(groups, { hours: 1, start, flow: true }) }))
+}
+
+// Failed calls, one row per what failed and where, linking to that place over the window
+// (from start, else the last hours); flow adds the model's traffic, for a list shown off Flow.
+function errorRows(groups, { hours, start, flow }) {
+  const at = start != null ? Math.min(start + hours * 3600, Date.now() / 1000) : undefined
+  return groups.map((g, i) => jsxs('div', { key: i, className: 'grid gap-1 py-2', children: [
+    jsxs('div', { className: 'flex flex-wrap items-center gap-2 text-[0.6875rem] text-(--ui-text-quaternary)', children: [
+      jsx(KindBox, { color: TONE.bad, children: plural(g.count, 'error') }),
+      jsx('span', { className: 'font-medium text-(--ui-text-primary)', children: `${g.platform ? `${g.platform} calls` : 'router'} on ${g.host || 'unknown host'}` }),
+      jsx('span', { className: 'ml-auto tabular-nums', style: { fontFamily: MONO }, children: g.first === g.last ? fmtClock(g.last) : `${fmtClock(g.first)} to ${fmtClock(g.last)}` })
+    ] }),
+    jsx('div', { style: { fontFamily: MONO, fontSize: 12, color: TONE.bad, overflowWrap: 'anywhere' }, children: g.error || `${g.event} failed` }),
+    jsx('div', { style: { fontSize: 12.5, color: DIM }, children: [
+      g.profile && `profile ${g.profile}`, g.model && `model ${g.model}`, g.served && `served by ${g.served}`,
+      g.sessions.length ? plural(g.sessions.length, 'session') : 'no session'].filter(Boolean).join(' · ') }),
+    jsxs('div', { className: 'flex flex-wrap gap-3', children: [
+      g.sessions.length ? jsx(GoLink, { key: 't', tab: 'trace', sel: g.sessions[0], hours, start,
+        children: g.sessions.length > 1 ? `Open the newest of ${g.sessions.length} sessions in Trace` : 'Open the session in Trace' }) : null,
+      // only a client's failed calls (with a platform) are counted in Flow
+      flow && g.platform && g.model ? jsx(GoLink, { key: 'f', tab: 'flow', sel: `model:${g.model}`, hours, start, children: 'Show the model in Flow' }) : null,
+      g.host ? jsx(GoLink, { key: 'm', tab: 'topology', sel: g.platform && g.profile ? `p:${g.host}:${g.profile}` : `h:${g.host}`, at, start,
+        note: `${plural(g.count, 'error')}, ${g.platform ? `${g.platform} calls` : 'router'} on ${g.host}: ${g.error || `${g.event} failed`}`,
+        children: g.platform && g.profile ? `Show ${g.profile} on ${g.host} on the map` : 'Show the host on the map' }) : null
+    ] })
+  ] }))
 }
 
 // What the tag on an attention card says: the state, in the source's own terms.
@@ -1002,6 +1005,8 @@ function FlowChart({ nodes, paths, total, sel, onSelect, color, live }) {
                 x: p.x + NW + 6,
                 y: f(p.y + Math.max(2, p.h) / 2 + 4),
                 fill: p.n.id === sel ? 'var(--ui-accent)' : 'currentColor',
+                // a halo in the page's color keeps the label readable where it crosses a band
+                stroke: 'var(--ui-bg, #0d1117)', strokeWidth: 3, strokeLinejoin: 'round', paintOrder: 'stroke',
                 fontSize: 12,
                 fontWeight: p.n.id === sel ? 600 : 400,
                 opacity: off ? 0.3 : 1,
@@ -1048,7 +1053,7 @@ function Breakdown({ title, items, of, onSelect }) {
   })
 }
 
-function FlowDetail({ nodes, paths, total, sel, onSelect, color, hours }) {
+function FlowDetail({ nodes, paths, total, sel, onSelect, color, hours, start }) {
   const byId = Object.fromEntries(nodes.map(n => [n.id, n]))
   const node = sel && byId[sel]
   if (!node)
@@ -1088,6 +1093,7 @@ function FlowDetail({ nodes, paths, total, sel, onSelect, color, hours }) {
           node.col === 'served' ? jsx(GoLink, { tab: 'topology', sel: `s:${node.id.slice('served:'.length)}`, hours, children: 'Show on the map' }) : null
         ]
       }),
+      node.errors ? jsx(FlowErrors, { node, hours, start }) : null,
       // every request took one route: name it in a line instead of lists that each read 100%
       through.length === 1
         ? jsxs('div', {
@@ -1118,17 +1124,37 @@ function FlowDetail({ nodes, paths, total, sel, onSelect, color, hours }) {
   })
 }
 
+// What failed among the selection's requests: the window's errors from a client on the same entry point, profile, model or server.
+function FlowErrors({ node, hours, start }) {
+  const { data, isLoading, isError } = useErrors(hours, start)
+  // matched on the label Flow gives a missing value
+  const value = g => ({ entry: g.platform, profile: g.profile || 'no profile', model: g.model || 'no model', served: g.served || 'unknown' })[node.col]
+  // the router's own errors (no platform) are not in Flow
+  const groups = (data?.groups || []).filter(g => g.platform && value(g) === node.label)
+  return jsxs('div', {
+    className: 'space-y-1',
+    children: [
+      jsx('div', { className: 'text-[0.6875rem] font-medium text-(--ui-text-quaternary)', children: 'What failed' }),
+      isError || data?.errors?.errors ? muted(`Could not load the errors: ${data?.errors?.errors || 'the backend did not respond'}.`)
+      : isLoading ? jsx(Skeleton, { className: 'h-16 w-full' })
+      : groups.length ? jsx('div', { className: 'divide-y divide-(--ui-stroke-secondary)', children: errorRows(groups, { hours, start }) })
+      : muted('These calls were recorded as failed without an error message.')
+    ]
+  })
+}
+
 function FlowHourly({ hourly, paths, served, sel, color }) {
-  // with a selection: each hour's requests through it, by what served them
-  const mine = h => {
+  // each hour's requests (key 'paths') or failed requests ('failed') by what served them, through the selection if any
+  const mine = (h, key = 'paths') => {
     const by = {}
-    if (sel) for (const [i, n] of Object.entries(h.paths || {})) if (paths[i]?.ids.includes(sel)) by[paths[i].ids[3]] = (by[paths[i].ids[3]] || 0) + n
+    for (const [i, n] of Object.entries(h[key] || {})) if (!sel || paths[i]?.ids.includes(sel)) by[paths[i].ids[3]] = (by[paths[i].ids[3]] || 0) + n
     return by
   }
   const label = sel && (served.find(n => n.id === sel)?.label ?? sel.slice(sel.indexOf(':') + 1))
   const used = new Set(sel ? hourly.flatMap(h => Object.keys(mine(h))) : served.map(n => n.id))
+  const anyFailed = hourly.some(h => Object.keys(mine(h, 'failed')).length)
   // a selection is often a sliver of the whole, so it is scaled to its own busiest hour and the rest is left out
-  const max = Math.max(1, ...hourly.map(h => Object.values(sel ? mine(h) : h.by).reduce((a, n) => a + n, 0)))
+  const max = Math.max(1, ...hourly.map(h => Object.values(mine(h)).reduce((a, n) => a + n, 0)))
   const wide = hourly.length > 30
   const counts = sel && !wide
   return jsxs('div', {
@@ -1142,16 +1168,20 @@ function FlowHourly({ hourly, paths, served, sel, color }) {
           const sum = Object.values(h.by).reduce((a, n) => a + n, 0)
           const on = mine(h)
           const onSum = Object.values(on).reduce((a, n) => a + n, 0)
+          const bad = mine(h, 'failed')
+          const badSum = Object.values(bad).reduce((a, n) => a + n, 0)
           const tip = [`${new Date(h.ts * 1000).toLocaleString([], { weekday: wide ? 'short' : undefined, hour: '2-digit', minute: '2-digit' })}: ${sel ? `${onSum} of ${sum} requests through ${label}` : `${sum} requests`}`,
-            ...served.filter(n => (sel ? on : h.by)[n.id]).map(n => `${n.label} ${(sel ? on : h.by)[n.id]}`)].join('\n')
+            ...served.filter(n => on[n.id]).map(n => `${n.label} ${on[n.id]}${bad[n.id] ? `, ${bad[n.id]} failed` : ''}`)].join('\n')
           return jsx('div', {
             key: h.ts,
             title: tip,
             className: 'flex h-full flex-1 flex-col justify-end',
             children: [
               counts && onSum ? jsx('div', { key: 'n', className: 'text-center text-[0.625rem] tabular-nums', style: { flex: 'none', color: DIM, lineHeight: '0.875rem' }, children: onSum }) : null,
+              // the hour's failed requests in red on top; each server's share below counts only what it answered
+              badSum ? jsx('div', { key: 'failed', style: { flex: 'none', height: `${(badSum / max) * 100}%`, backgroundColor: TONE.bad, opacity: 0.85 } }) : null,
               ...[...served].reverse().flatMap(n => {
-                const part = (sel ? on : h.by)[n.id] || 0
+                const part = (on[n.id] || 0) - (bad[n.id] || 0)
                 // flex none: a full-height bar pushes its count up into the padding instead of shrinking
                 return [
                   part ? jsx('div', { key: n.id, style: { flex: 'none', height: `${(part / max) * 100}%`, backgroundColor: color(n.id), opacity: 0.85 } }) : null
@@ -1179,7 +1209,8 @@ function FlowHourly({ hourly, paths, served, sel, color }) {
             style: { opacity: used.has(n.id) ? 1 : 0.35 },
             children: [jsx('span', { style: { width: 8, height: 8, display: 'inline-block', backgroundColor: color(n.id) } }), n.label]
           })
-        )
+        ).concat(anyFailed ? [jsxs('span', { key: 'failed', className: 'flex items-center gap-1', children: [
+          jsx('span', { style: { width: 8, height: 8, display: 'inline-block', backgroundColor: TONE.bad } }), 'failed'] })] : [])
       })
     ]
   })
@@ -1201,7 +1232,7 @@ function FlowPage({ sel: initial, when = {}, remember }) {
   const colors = servedColors(served.map(n => n.id))
   const color = id => colors[id] || SERVED_COLORS[SERVED_COLORS.length - 1]
   const sel = nodes.some(n => n.id === selected) ? selected : null
-  const args = { nodes, paths: data.paths || [], total: data.total, sel, onSelect: setSelected, color, hours }
+  const args = { nodes, paths: data.paths || [], total: data.total, sel, onSelect: setSelected, color, hours, start }
   const node = sel && nodes.find(n => n.id === sel)
   const KINDS = { entry: 'entry point', profile: 'profile', model: 'model', served: 'served by' }
   const kind = node && (node.col === 'served' ? (node.pool_device ? 'pool device' : 'provider') : KINDS[node.col])

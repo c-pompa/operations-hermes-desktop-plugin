@@ -678,6 +678,7 @@ def request_flow(m: sqlite3.Connection, since: float, until: float) -> Dict[str,
     # a window that ends on the hour (one hour from the Today strip) has no bucket after it
     hourly = [{"ts": start + h * 3600, "by": {}} for h in range(max(1, -int((start - now) // 3600)))]
     hour_paths: List[Dict[tuple, int]] = [{} for _ in hourly]
+    hour_failed: List[Dict[tuple, int]] = [{} for _ in hourly]
     nodes: Dict[str, Dict[str, Any]] = {}
     durations: Dict[str, List[float]] = {}
     paths: Dict[tuple, int] = {}
@@ -696,13 +697,16 @@ def request_flow(m: sqlite3.Connection, since: float, until: float) -> Dict[str,
         by = hourly[h]["by"]
         by[ids[-1]] = by.get(ids[-1], 0) + 1
         hour_paths[h][tuple(ids)] = hour_paths[h].get(tuple(ids), 0) + 1
+        if err:
+            hour_failed[h][tuple(ids)] = hour_failed[h].get(tuple(ids), 0) + 1
     for nid, n in nodes.items():
         n["p95_s"] = _p95(durations.get(nid, []))
     ordered = sorted(paths.items(), key=lambda p: -p[1])
-    # each hour's requests by path (its index in "paths"), so the page can chart any selection over time
+    # each hour's requests and failed requests by path (its index in "paths"), so the page can chart any selection over time
     index = {ids: i for i, (ids, _) in enumerate(ordered)}
-    for hour, counts in zip(hourly, hour_paths):
+    for hour, counts, failed in zip(hourly, hour_paths, hour_failed):
         hour["paths"] = {index[ids]: n for ids, n in counts.items()}
+        hour["failed"] = {index[ids]: n for ids, n in failed.items()}
     return {"total": len(rows),
             "nodes": sorted(nodes.values(), key=lambda n: (FLOW_COLUMNS.index(n["col"]), -n["requests"], n["label"])),
             "paths": [{"ids": list(ids), "requests": n} for ids, n in ordered],

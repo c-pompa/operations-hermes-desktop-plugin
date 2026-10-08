@@ -108,6 +108,11 @@ class FlowTest(unittest.TestCase):
         for i, p in enumerate(out["paths"]):
             self.assertEqual(sum(h["paths"].get(i, 0) for h in out["hourly"]), p["requests"])
 
+    def test_hourly_failed_by_path(self):
+        out = api.flow(24)
+        # only the cron call that timed out failed; an empty error string is not a failure
+        self.assertEqual([sum(h["failed"].get(i, 0) for h in out["hourly"]) for i in range(len(out["paths"]))], [0, 1, 0])
+
     def test_older_database_without_profile_or_provider(self):
         m = sqlite3.connect(self.db)
         m.execute("ALTER TABLE records DROP COLUMN profile")
