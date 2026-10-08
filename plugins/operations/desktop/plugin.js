@@ -15,8 +15,8 @@
  * Merge requests tab: open MRs and those merged in the window, each with its newest pipeline's
  * stages, who it waits on, and counts by repo.
  * Topology tab: gateways, hosts and what served their requests (pool devices and cloud
- * providers), with live state and conformance drift; selecting one shows its details and
- * what stops if it goes down.
+ * providers), with live state and conformance drift; counts on chips, details in the
+ * inspector or a collapsed sheet; selecting one shows its details and what stops if it goes down.
  * Conformance tab: the fleet standard's repo checks from CI and each host's checks from its
  * metrics forwarder, optional per install.
  *
@@ -2711,7 +2711,7 @@ function topoIssues(data, now) {
   for (const [to, list] of Object.entries(fallback)) {
     const n = list.reduce((a, x) => a + x.n, 0), one = list.length === 1
     const short = r => r.name.replace(/^hermes\//, '')
-    out.push({ key: `r:${list.map(x => x.r.name).join('+')}`, tone: n ? 'warn' : 'muted', quiet: !n,
+    out.push({ key: `r:${list.map(x => x.r.name).join('+')}`, tone: n ? 'warn' : 'muted', quiet: !n, roles: list.length, to,
                nodes: [...list.map(x => `r:${x.r.name}`), 'r:router', ...list[0].on.map(d => `s:${d}`)],
                text: one ? `${short(list[0].r)} on fallback to ${to}, ${plural(n, 'request')}`
                          : `${list.length} roles on fallback to ${to} (${list.map(x => short(x.r)).join(', ')}), ${plural(n, 'request')}`,
@@ -3085,47 +3085,65 @@ function TopologyDetail({ data, sel, g }) {
 }
 
 // The router's role aliases: candidates best first, the one each role resolves to now and where it is loaded.
-function RouterRoles({ data, hours, onPick }) {
+function RouterRoles({ data, hours, onPick, open, onToggle }) {
   const r = data.router
   if (!r) return null
-  return jsx(Section, {
-    title: 'Roles',
-    count: r.roles.length ? `${r.roles.length} role aliases from the model router · green serving now, outlined loaded, faded not loaded` : null,
-    children: r.error
-      ? muted(`No model router answered at ${r.url} (${r.error}). Without one, Blast radius uses observed traffic only. The router plugin's MODEL_ROUTER_URL setting points it elsewhere.`)
-      : !r.roles.length
-        ? muted('The model router has no role aliases.')
-        : jsx('div', {
-            className: 'grid gap-x-3 gap-y-1 text-xs',
-            style: { gridTemplateColumns: 'minmax(8rem, auto) 1fr' },
-            children: r.roles.flatMap(role => {
-              const on = roleDevices(data, role.resolved)
-              const n = (data.timeline?.flow || []).filter(f => f[4] === role.name).reduce((a, f) => a + f[7], 0)
-              return [
-                jsxs('div', { key: `${role.name}-n`, className: 'truncate font-medium', children: [
-                  onPick
-                    ? jsx('button', { type: 'button', className: 'hover:text-(--ui-accent) hover:underline', title: `Select ${role.name} on the map`, onClick: () => { haptic('tap'); onPick(`r:${role.name}`) }, children: role.name })
-                    : jsx('span', { title: role.name, children: role.name }),
-                  role.strict ? jsx('span', { className: 'ml-1 text-(--ui-text-quaternary)', children: 'strict' }) : null] }),
-                jsxs('div', {
-                  key: `${role.name}-c`,
-                  className: 'flex min-w-0 flex-wrap items-center gap-1',
-                  children: [
-                    ...role.candidates.map((c, i) =>
-                      jsx(Badge, {
-                        key: `${i}-${c.model}`,
-                        variant: c.model === role.resolved && c.live ? 'success' : 'outline',
-                        title: !c.live ? 'not loaded' : !c.fit ? 'loaded, but does not fit the role' : 'loaded',
-                        style: c.live ? undefined : { opacity: 0.5 },
-                        children: c.model
-                      })),
-                    jsx('span', { className: 'text-(--ui-text-quaternary)', children: on.length ? `on ${on.join(', ')}` : role.resolved ? `${role.resolved} is not in the pool now` : 'nothing to serve it' }),
-                    n ? jsx(GoLink, { tab: 'flow', sel: `model:${role.name}`, hours, children: `See its traffic (${n})` }) : null
+  const s = rolesSummary(data)
+  return jsxs('div', {
+    className: 'overflow-hidden rounded-md border border-(--ui-stroke-secondary)',
+    children: [
+      jsxs('button', {
+        type: 'button',
+        'aria-expanded': !!open,
+        onClick: () => { haptic('tap'); onToggle?.() },
+        className: 'flex w-full flex-wrap items-center gap-x-3 gap-y-1 px-3 py-1.5 text-left text-xs hover:bg-(--chrome-action-hover)',
+        children: [
+          jsx('span', { className: 'font-medium', children: 'Roles' }),
+          r.roles.length ? jsx('span', { className: 'text-(--ui-text-quaternary)', children: `${s.n} aliases · green serving now, outlined loaded, faded not loaded` }) : null,
+          s.fallback ? jsx('span', { className: 'text-(--ui-text-quaternary)', children: `${s.fallback} on fallback` }) : null,
+          s.requests ? jsx('span', { className: 'text-(--ui-text-quaternary)', children: plural(s.requests, 'request') }) : null,
+          jsx('span', { className: 'ml-auto text-(--ui-text-quaternary)', children: open ? 'Hide' : 'Show' })
+        ]
+      }),
+      open ? jsx('div', {
+        className: 'border-t border-(--ui-stroke-secondary) p-3',
+        children: r.error
+          ? muted(`No model router answered at ${r.url} (${r.error}). Without one, Blast radius uses observed traffic only. The router plugin's MODEL_ROUTER_URL setting points it elsewhere.`)
+          : !r.roles.length
+            ? muted('The model router has no role aliases.')
+            : jsx('div', {
+                className: 'grid gap-x-3 gap-y-1 text-xs',
+                style: { gridTemplateColumns: 'minmax(8rem, auto) 1fr' },
+                children: r.roles.flatMap(role => {
+                  const on = roleDevices(data, role.resolved)
+                  const n = (data.timeline?.flow || []).filter(f => f[4] === role.name).reduce((a, f) => a + f[7], 0)
+                  return [
+                    jsxs('div', { key: `${role.name}-n`, className: 'truncate font-medium', children: [
+                      onPick
+                        ? jsx('button', { type: 'button', className: 'hover:text-(--ui-accent) hover:underline', title: `Select ${role.name} on the map`, onClick: () => { haptic('tap'); onPick(`r:${role.name}`) }, children: role.name })
+                        : jsx('span', { title: role.name, children: role.name }),
+                      role.strict ? jsx('span', { className: 'ml-1 text-(--ui-text-quaternary)', children: 'strict' }) : null] }),
+                    jsxs('div', {
+                      key: `${role.name}-c`,
+                      className: 'flex min-w-0 flex-wrap items-center gap-1',
+                      children: [
+                        ...role.candidates.map((c, i) =>
+                          jsx(Badge, {
+                            key: `${i}-${c.model}`,
+                            variant: c.model === role.resolved && c.live ? 'success' : 'outline',
+                            title: !c.live ? 'not loaded' : !c.fit ? 'loaded, but does not fit the role' : 'loaded',
+                            style: c.live ? undefined : { opacity: 0.5 },
+                            children: c.model
+                          })),
+                        jsx('span', { className: 'text-(--ui-text-quaternary)', children: on.length ? `on ${on.join(', ')}` : role.resolved ? `${role.resolved} is not in the pool now` : 'nothing to serve it' }),
+                        n ? jsx(GoLink, { tab: 'flow', sel: `model:${role.name}`, hours, children: `See its traffic (${n})` }) : null
+                      ]
+                    })
                   ]
                 })
-              ]
-            })
-          })
+              })
+      }) : null
+    ]
   })
 }
 
@@ -3159,7 +3177,45 @@ const CHANGE_KIND = [
 const CHANGE_COLOR = { bad: TONE.bad, warn: TONE.warn, good: TONE.good, info: TONE.info, drift: DRIFT, muted: TONE.muted }
 const changeNode = c => (c.node.startsWith('d:') ? `h:${c.node.slice(2)}` : c.node)
 
-function TopologyChanges({ data, at, fmt, hours, start, onPick }) {
+// Counts first: gateway/host problems, each fallback group, drift, then how many role aliases.
+// A role on fallback with no requests stays off the chips (`quiet`).
+function chromeChips(issues, router) {
+  const loud = issues.filter(i => !i.quiet)
+  const fallbacks = loud.filter(i => i.tone === 'warn' && i.key.startsWith('r:'))
+  const drifts = loud.filter(i => i.tone === 'drift')
+  const skip = new Set([...fallbacks, ...drifts])
+  const problems = loud.filter(i => !skip.has(i))
+  const chips = []
+  if (problems.length) chips.push({ key: 'issues', tone: 'bad', label: plural(problems.length, 'issue'), items: problems })
+  for (const i of fallbacks) chips.push({ key: i.key, tone: 'warn', label: `${i.roles} fallback · ${i.to}`, items: [i] })
+  if (drifts.length) chips.push({ key: 'drift', tone: 'drift', label: `${drifts.length} drift`, items: drifts })
+  const n = router?.roles?.length || 0
+  if (n) chips.push({ key: 'roles', tone: 'info', label: plural(n, 'role'), items: [] })
+  return chips
+}
+
+function changePills(changes) {
+  const counts = {}
+  for (const c of changes) {
+    const k = CHANGE_KIND.find(([n, tone]) => tone === c.tone && (!n || c.node.startsWith(`${n}:`)))
+    if (k) counts[k[2]] = [(counts[k[2]]?.[0] || 0) + 1, k]
+  }
+  return CHANGE_KIND.filter((k, i, a) => counts[k[2]] && a.findIndex(x => x[2] === k[2]) === i)
+    .map(k => [counts[k[2]][0], k[2], k[3], counts[k[2]][1][1]])
+}
+
+function rolesSummary(data) {
+  const roles = data.router?.roles || []
+  const names = new Set(roles.map(r => r.name))
+  return {
+    n: roles.length,
+    fallback: roles.filter(onFallback).length,
+    requests: (data.timeline?.flow || []).filter(f => names.has(f[4])).reduce((a, f) => a + f[7], 0)
+  }
+}
+
+function TopologyChanges({ data, at, fmt, hours, start, span, onPick }) {
+  const [open, setOpen] = useState(false)
   const changes = mergeRestarts(data.timeline?.changes || [])
   const [all, setAll] = useState(false)
   // the same change to the same node again, a gateway restarted four times, is one chip at its newest
@@ -3170,58 +3226,77 @@ function TopologyChanges({ data, at, fmt, hours, start, onPick }) {
     else groups.push([c])
   }
   const shown = all ? groups : groups.slice(0, 8)
-  const counts = {}
-  for (const c of changes) {
-    const k = CHANGE_KIND.find(([n, tone]) => tone === c.tone && (!n || c.node.startsWith(`${n}:`)))
-    if (k) counts[k[2]] = [(counts[k[2]]?.[0] || 0) + 1, k]
-  }
+  const pills = changePills(changes)
+  const n = changes.length + (data.timeline?.more_changes || 0)
   const total = data.edges.reduce((a, e) => a + e.requests, 0)
   const share = {}
   for (const e of data.edges) share[e.served] = (share[e.served] || 0) + e.requests
-  const [top, n] = Object.entries(share).sort((a, b) => b[1] - a[1])[0] || []
+  const [top, req] = Object.entries(share).sort((a, b) => b[1] - a[1])[0] || []
   // the profiles sending it the most
   const from = {}
   for (const f of data.timeline?.flow || []) if (f[5] === top) from[f[3]] = (from[f[3]] || 0) + f[7]
   const by = Object.entries(from).sort((a, b) => b[1] - a[1]).slice(0, 2)
   return jsxs('div', {
-    className: 'space-y-1.5 text-xs',
+    className: 'overflow-hidden rounded-md border border-(--ui-stroke-secondary)',
     children: [
-      jsx('div', { children: changes.length
-        ? `${plural(changes.length + (data.timeline.more_changes || 0), 'change')}: ${Object.values(counts).map(([n, k]) => `${n} ${n === 1 ? k[2] : k[3]}`).join(', ')}.`
-        : 'No gateway, host, pool or conformance changes in this window.' }),
-      total && n / total > 0.6 ? jsxs('div', { className: 'flex flex-wrap items-baseline gap-x-2', children: [
-        jsx('span', { children: `${top} served ${Math.round((100 * n) / total)}% of the window's ${total} requests${by[0]?.[1] === n ? `, all from ${by[0][0]}` : by.length ? `, mostly from ${by.map(([p, k]) => `${p} (${Math.round((100 * k) / n)}%)`).join(' and ')}` : ''}.` }),
-        jsx(GoLink, { tab: 'flow', sel: `served:${top}`, ...(start ? { hours: 1, start } : { hours }), children: 'See its traffic' })
-      ] }) : null,
-      changes.length ? jsx('div', {
-        className: 'flex flex-wrap gap-1',
+      jsxs('button', {
+        type: 'button',
+        'aria-expanded': open,
+        onClick: () => { haptic('tap'); setOpen(v => !v) },
+        className: 'flex w-full flex-wrap items-center gap-x-3 gap-y-1 px-3 py-1.5 text-left text-xs hover:bg-(--chrome-action-hover)',
         children: [
-          ...shown.map((g, i) => {
-            const c = g[0], later = at && c.ts > at
-            return jsxs('button', {
-              key: i,
-              type: 'button',
-              onClick: () => onPick(c),
-              className: cn('flex items-center gap-1 rounded border border-(--ui-stroke-secondary) px-1.5 py-0.5 hover:bg-(--chrome-action-hover)', later && 'border-dashed opacity-50'),
-              title: later ? `After ${fmt(at)}, the time the map is replayed to. Replay to this moment instead.` : 'Replay the map to this moment',
-              children: [
-                jsx('span', { style: { width: 6, height: 6, borderRadius: 3, background: CHANGE_COLOR[c.tone] || TONE.muted } }),
-                jsx('span', { className: 'tabular-nums text-(--ui-text-quaternary)', children: g.length > 1 ? `${fmt(g.at(-1).ts)} to ${fmt(c.ts)}` : fmt(c.ts) }),
-                jsx('span', { children: `${c.text}${g.length > 1 ? ` ${g.length} times` : ''}${c.list ? ` (${c.list})` : ''}` }),
-                later ? jsx('span', { className: 'text-(--ui-text-quaternary)', children: 'later' }) : null
-              ]
-            })
-          }),
-          groups.length > 8 ? jsx('button', {
-            key: 'all',
-            type: 'button',
-            onClick: () => setAll(!all),
-            className: 'rounded px-1.5 py-0.5 text-(--ui-accent) hover:bg-(--chrome-action-hover)',
-            children: all ? 'Show the newest 8' : `Show all ${groups.length}`
-          }) : null
+          jsx('span', { className: 'font-medium', children: 'What changed' }),
+          jsx('span', { className: 'text-(--ui-text-quaternary)', children: `${start ? span : `last ${hours}h`} · ${plural(n, 'change')}` }),
+          ...pills.map(([count, one, many, tone]) => jsxs('span', {
+            key: one,
+            className: 'inline-flex items-center gap-1 text-(--ui-text-quaternary)',
+            children: [
+              jsx('i', { style: { width: 6, height: 6, borderRadius: 3, background: CHANGE_COLOR[tone] || TONE.muted } }),
+              `${count} ${count === 1 ? one : many}`
+            ]
+          })),
+          jsx('span', { className: 'ml-auto text-(--ui-text-quaternary)', children: open ? 'Hide' : 'Show' })
         ]
-      }) : null,
-      data.timeline?.more_changes ? muted(`${plural(data.timeline.more_changes, 'older change')} not listed.`) : null
+      }),
+      open ? jsxs('div', {
+        className: 'space-y-1.5 border-t border-(--ui-stroke-secondary) p-3 text-xs',
+        children: [
+          !changes.length ? jsx('div', { children: 'No gateway, host, pool or conformance changes in this window.' }) : null,
+          total && req / total > 0.6 ? jsxs('div', { className: 'flex flex-wrap items-baseline gap-x-2', children: [
+            jsx('span', { children: `${top} served ${Math.round((100 * req) / total)}% of the window's ${total} requests${by[0]?.[1] === req ? `, all from ${by[0][0]}` : by.length ? `, mostly from ${by.map(([p, k]) => `${p} (${Math.round((100 * k) / req)}%)`).join(' and ')}` : ''}.` }),
+            jsx(GoLink, { tab: 'flow', sel: `served:${top}`, ...(start ? { hours: 1, start } : { hours }), children: 'See its traffic' })
+          ] }) : null,
+          changes.length ? jsx('div', {
+            className: 'flex flex-wrap gap-1',
+            children: [
+              ...shown.map((g, i) => {
+                const c = g[0], later = at && c.ts > at
+                return jsxs('button', {
+                  key: i,
+                  type: 'button',
+                  onClick: () => onPick(c),
+                  className: cn('flex items-center gap-1 rounded border border-(--ui-stroke-secondary) px-1.5 py-0.5 hover:bg-(--chrome-action-hover)', later && 'border-dashed opacity-50'),
+                  title: later ? `After ${fmt(at)}, the time the map is replayed to. Replay to this moment instead.` : 'Replay the map to this moment',
+                  children: [
+                    jsx('span', { style: { width: 6, height: 6, borderRadius: 3, background: CHANGE_COLOR[c.tone] || TONE.muted } }),
+                    jsx('span', { className: 'tabular-nums text-(--ui-text-quaternary)', children: g.length > 1 ? `${fmt(g.at(-1).ts)} to ${fmt(c.ts)}` : fmt(c.ts) }),
+                    jsx('span', { children: `${c.text}${g.length > 1 ? ` ${g.length} times` : ''}${c.list ? ` (${c.list})` : ''}` }),
+                    later ? jsx('span', { className: 'text-(--ui-text-quaternary)', children: 'later' }) : null
+                  ]
+                })
+              }),
+              groups.length > 8 ? jsx('button', {
+                key: 'all',
+                type: 'button',
+                onClick: () => setAll(!all),
+                className: 'rounded px-1.5 py-0.5 text-(--ui-accent) hover:bg-(--chrome-action-hover)',
+                children: all ? 'Show the newest 8' : `Show all ${groups.length}`
+              }) : null
+            ]
+          }) : null,
+          data.timeline?.more_changes ? muted(`${plural(data.timeline.more_changes, 'older change')} not listed.`) : null
+        ]
+      }) : null
     ]
   })
 }
@@ -3533,6 +3608,8 @@ function TopologyPage({ sel: initial, when = {}, remember }) {
   const [openIssue, setOpenIssue] = useState(null)
   const [tip, setTip] = useState(null)
   const [eachRole, setEachRole] = useState(false)
+  const [view, setView] = useState(false)
+  const [rolesOpen, setRolesOpen] = useState(false)
   const layout = chosen || role?.layout || 'area'
   const { data: live, isLoading, isError } = useTopology(hours)
   // replay steps one timeline bucket every quarter second and goes back to live at the end
@@ -3544,6 +3621,12 @@ function TopologyPage({ sel: initial, when = {}, remember }) {
     return () => clearInterval(id)
   }, [playing, step, end])
   useEffect(() => { if (playing && at == null) setPlaying(false) }, [playing, at])
+  useEffect(() => {
+    if (!view) return
+    const key = e => { if (e.key === 'Escape') setView(false) }
+    window.addEventListener('keydown', key)
+    return () => window.removeEventListener('keydown', key)
+  }, [view])
   // the keys read this render's handlers through a ref, so one listener serves every render
   const keys = useRef({})
   const mapRef = useRef(null)
@@ -3569,7 +3652,6 @@ function TopologyPage({ sel: initial, when = {}, remember }) {
   const full = flow ? flowGraph(data, { ...FLOW_LAYOUT[layout], ...(eachRole && { router: false }), collapse }) : topoGraph(data)
   const issues = topoIssues(data, data.at || end)
   const shown = issues.find(i => i.key === openIssue)
-  const worst = ['bad', 'drift', 'warn'].find(t => issues.some(i => i.tone === t)) || 'muted'
   // issues only: the nodes an issue points at and their neighbours
   const hit = new Set(full.nodes.filter(n => issues.some(i => issueHits(i, n.id))).map(n => n.id))
   const keep = new Set([...hit, ...full.edges.filter(e => hit.has(e.a) || hit.has(e.b)).flatMap(e => [e.a, e.b])])
@@ -3587,6 +3669,16 @@ function TopologyPage({ sel: initial, when = {}, remember }) {
     : live
   const span = `${fmt(t0)} to ${fmt(top)}`
   const pickChange = c => { setPlaying(false); setAt(c.ts); setSel(changeNode(c)) }
+  const chips = chromeChips(issues, data.router)
+  const pickChip = chip => {
+    haptic('tap')
+    if (chip.key === 'roles') return setRolesOpen(v => !v)
+    const items = chip.items || []
+    if (!items.length) return
+    const next = items[items.findIndex(i => i.key === openIssue) + 1]
+    setOpenIssue(next?.key ?? null)
+    if (next) setSel(full.nodes.find(n => issueHits(next, n.id))?.id || null)
+  }
   const play = () => {
     if (playing) return setPlaying(false)
     setFrom(null)
@@ -3694,27 +3786,67 @@ function TopologyPage({ sel: initial, when = {}, remember }) {
         ]
       }) : null,
       jsxs('div', {
-        className: 'flex flex-wrap items-center gap-x-3 gap-y-1 rounded border px-3 py-1.5 text-xs',
-        style: { borderColor: issues.length ? CHANGE_COLOR[worst] : 'var(--ui-stroke-secondary)' },
+        className: 'flex flex-wrap items-center gap-2',
         children: [
-          jsx('span', { className: 'font-medium', style: issues.length ? { color: CHANGE_COLOR[worst] } : undefined, children: issues.length ? plural(issues.length, 'issue') : 'No issues' }),
-          ...issues.map(i => jsx('button', {
-            key: i.key, type: 'button', 'aria-expanded': i.key === openIssue,
-            onClick: () => { haptic('tap'); setOpenIssue(i.key === openIssue ? null : i.key); setSel(full.nodes.find(n => issueHits(i, n.id))?.id || null) },
-            className: cn('rounded px-1 hover:bg-(--chrome-action-hover)', i.key === openIssue && 'underline'),
-            style: { color: CHANGE_COLOR[i.tone] || TONE.muted },
-            title: 'Why, and what to do about it',
-            children: i.text
-          })),
-          jsx('span', { className: 'ml-auto text-[0.6875rem] text-(--ui-text-quaternary)', children: 'Space play · L live · I issues only · arrows step through changes' })
+          ...chips.map(c => {
+            const on = c.key === 'roles' ? rolesOpen : c.items.some(i => i.key === openIssue)
+            const color = CHANGE_COLOR[c.tone] || TONE.info
+            return jsxs('button', {
+              key: c.key, type: 'button', 'aria-pressed': on,
+              onClick: () => pickChip(c),
+              title: c.items.map(i => i.text).filter(Boolean).join(' · ') || (c.key === 'roles' ? 'Open the roles list' : undefined),
+              className: 'inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 font-medium hover:bg-(--chrome-action-hover)',
+              style: {
+                fontFamily: MONO, fontSize: 12, color,
+                borderColor: `color-mix(in srgb, ${color} 45%, var(--ui-stroke-secondary))`,
+                background: on ? `color-mix(in srgb, ${color} 12%, transparent)` : undefined
+              },
+              children: [
+                jsx('i', { style: { width: 6, height: 6, borderRadius: 3, background: 'currentColor' } }),
+                c.label
+              ]
+            })
+          }),
+          !issues.some(i => !i.quiet) ? jsx('span', { className: 'text-[0.6875rem] text-(--ui-text-quaternary)', children: 'No issues' }) : null,
+          jsx('span', { className: 'ml-auto text-[0.6875rem] text-(--ui-text-quaternary)', children: `${LAYOUT_NAMES[layout] || layout}${role && !chosen ? ` · ${role.name} default` : ''}` }),
+          jsxs('div', {
+            className: 'relative',
+            children: [
+              jsx('button', {
+                type: 'button', 'aria-expanded': view,
+                onClick: () => { haptic('tap'); setView(v => !v) },
+                className: 'rounded border border-(--ui-stroke-secondary) px-2.5 py-1 text-[0.6875rem] text-(--ui-text-secondary) hover:bg-(--chrome-action-hover)',
+                children: 'View'
+              }),
+              view ? jsxs('div', {
+                className: 'absolute right-0 z-10 mt-1 w-[min(26rem,calc(100vw-2rem))] space-y-2 rounded-md border border-(--ui-stroke-secondary) p-3 text-xs shadow-lg',
+                style: { background: 'var(--ui-bg, var(--chrome-bg))' },
+                children: [
+                  jsx('div', { className: 'font-medium', children: 'View' }),
+                  jsx(Seg, { options: LAYOUTS.map(([k, name]) => [k, name]), value: layout, onChange: setLayout }),
+                  jsxs('div', {
+                    className: 'flex flex-wrap items-center gap-3',
+                    children: [
+                      check('Collapse to one orchestrator', collapse, setCollapse, !flow, flow ? 'Fold every profile into one node' : 'Area grouping and Router switchboard only'),
+                      check('Show each role', eachRole, setEachRole, layout !== 'area', layout === 'area' ? 'Split the router into its role aliases, as a ring' : 'Area grouping only; the switchboard always shows each role'),
+                      check('Traffic', traffic, setTraffic, false, 'Moving dots and a glow on what had requests in the last two buckets'),
+                      check(`Issues only (${issues.length} active)`, issuesOnly, setIssuesOnly, false, 'Only what an issue points at and its neighbours (I)')
+                    ]
+                  }),
+                  jsx('button', {
+                    type: 'button', 'aria-expanded': styles,
+                    onClick: () => { haptic('tap'); setStyles(!styles) },
+                    className: 'text-[0.6875rem] text-(--ui-accent) hover:underline',
+                    children: styles ? 'Hide layout styles' : 'Compare all fifteen'
+                  }),
+                  jsx('div', { className: 'text-[0.6875rem] text-(--ui-text-quaternary)', children: 'Space play · L live · I issues only · arrows step through changes' })
+                ]
+              }) : null
+            ]
+          })
         ]
       }),
       shown ? jsx(IssueDrawer, { issue: shown, fmt, onClose: () => setOpenIssue(null) }, shown.key) : null,
-      live.timeline ? jsx(Section, {
-        title: 'What changed on the map',
-        count: `${from ? span : `last ${hours}h`}, newest first`,
-        children: jsx(TopologyChanges, { data: changes, at: data.at, fmt, hours, start: from, onPick: pickChange })
-      }) : null,
       jsx(Section, {
         title: data.at ? `Topology as of ${fmt(data.at)}` : 'Map',
         count: flow
@@ -3725,28 +3857,6 @@ function TopologyPage({ sel: initial, when = {}, remember }) {
           : jsxs('div', {
               className: 'space-y-3',
               children: [
-                jsxs('div', {
-                  className: 'flex flex-wrap items-center gap-2',
-                  children: [
-                    jsx(Seg, { options: LAYOUTS.map(([k, name]) => [k, name]), value: layout, onChange: setLayout }),
-                    role && !chosen ? jsx('span', { className: 'text-[0.6875rem] text-(--ui-text-quaternary)', children: `${role.name} default` }) : null,
-                    jsx('span', { className: 'ml-auto' }),
-                    jsx('button', {
-                      type: 'button', 'aria-expanded': styles, onClick: () => { haptic('tap'); setStyles(!styles) },
-                      className: 'text-[0.6875rem] text-(--ui-accent) hover:underline',
-                      children: styles ? 'Hide layout styles' : 'Compare all fifteen'
-                    })
-                  ]
-                }),
-                jsxs('div', {
-                  className: 'flex flex-wrap items-center gap-3',
-                  children: [
-                    check('Collapse to one orchestrator', collapse, setCollapse, !flow, flow ? 'Fold every profile into one node' : 'Area grouping and Router switchboard only'),
-                    check('Show each role', eachRole, setEachRole, layout !== 'area', layout === 'area' ? 'Split the router into its role aliases, as a ring' : 'Area grouping only; the switchboard always shows each role'),
-                    check('Traffic', traffic, setTraffic, false, 'Moving dots and a glow on what had requests in the last two buckets'),
-                    check(`Issues only (${issues.length} active)`, issuesOnly, setIssuesOnly, false, 'Only what an issue points at and its neighbours (I)')
-                  ]
-                }),
                 g.nodes.length
                   ? jsx('div', { ref: mapRef, children: jsx(TopologyMap, { g, sel, onSelect: setSel, layout, traffic, live: !data.at && !playing }) })
                   : muted(issuesOnly ? 'No issues on this layout at this time.' : 'Nothing to draw.'),
@@ -3755,8 +3865,10 @@ function TopologyPage({ sel: initial, when = {}, remember }) {
             })
       }),
       styles ? jsx(LayoutStyles, { layout, onLayout: setLayout }) : null,
+      live.timeline ? jsx(TopologyChanges, { data: changes, at: data.at, fmt, hours, start: from, span, onPick: pickChange }) : null,
       data.at && data.router ? muted('Roles show the model router as it is now, not as of the replayed time.') : null,
-      jsx(RouterRoles, { data, hours, onPick: flow ? id => { setSel(id); mapRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }) } : null })
+      jsx(RouterRoles, { data, hours, open: rolesOpen, onToggle: () => setRolesOpen(v => !v),
+        onPick: flow ? id => { setSel(id); mapRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }) } : null })
     ]
   })
 }

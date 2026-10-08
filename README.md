@@ -78,24 +78,28 @@ providers with the models each holds) follow each request from its entry point t
 profile and role alias to what served it. Their legend lists only the kinds of line drawn, an
 idle router says "no requests", and hovering a node or line shows its request count. In area grouping the router has one line
 to each device, or with "Show each role" a ring of its role aliases, the columns moving right to fit; when that line carries roles on fallback and roles on their first choice it draws
-as fallback over the first-choice color, and its hover names both. On those two, "Collapse to one orchestrator" folds
-every profile into one node. "Traffic" adds moving dots and a glow on what had requests in
-the last two buckets (off by default when the system asks for reduced motion). A bar over the
-map lists the active issues (a gateway down, a pool device offline, a host that stopped
-reporting, roles on a fallback model, one issue per device they fell back to, a role nothing in the pool serves, which still gets its box, a drifted host), outlined in the worst one's color; an
-issue opens a side drawer with why it is happening, the facts behind it, a command to copy where one fixes it,
-and links to the tab that shows more (no traffic link when the issue has no requests), and
-selects its node. "Issues only" keeps just the nodes
-an issue points at and their neighbours. "Replay a day" plays the last 24 hours from the start,
+as fallback over the first-choice color, and its hover names both. Layouts, "Collapse to one
+orchestrator" (folds every profile into one node on those two), "Show each role", "Traffic"
+(moving dots and a glow on what had requests in the last two buckets; off by default when the
+system asks for reduced motion), "Issues only" and the keys live under View, with the current
+layout and whose default it is on the bar. A chip bar over the map counts the loud issues (a
+gateway down, a pool device offline, a host that stopped reporting, a role nothing in the pool
+serves), each fallback group (where they landed), drift, and how many role aliases the router
+has. A role on fallback with no requests stays off the chips. A chip opens the existing issue
+drawer (why, the facts, a command to copy where one fixes it, links to the tab that shows more;
+no traffic link when the issue has no requests) and selects its node; the roles chip opens the
+Roles sheet. "Issues only" keeps just the nodes an issue points at and their neighbours.
+"Replay a day" plays the last 24 hours from the start,
 a bucket every quarter second, and returns to live at the end. Keys: Space plays or pauses,
 L goes back to live, I toggles issues only, and the arrow keys step to the previous or next
-change or issue start. Under the map, what changed in the window shows as chips, with a repeated
-change to one node, like a gateway restarted four times, as one chip with its count and time span.
+change or issue start. Under the map, What changed and Roles start collapsed: counts and kind
+pills on the header, the event chips and the aliases table on Show. A repeated
+change to one node, like a gateway restarted four times, is one chip with its count and time span.
 A gateway restart that takes several platforms on a host down and back at once counts as one
 restart, listing the platforms. When one server took most of the window's requests the line says
 which profiles sent them and links to its traffic. Lines with no requests in the window are drawn
 faint. A tick on the as-of track shows the change on hover and replays to it on click. In the Roles
-table a role's name selects it on the map, and "See its traffic" opens it on Flow. "Compare all fifteen" shows the layout styles considered side by side
+table a role's name selects it on the map, and "See its traffic" opens it on Flow. "Compare all fifteen" (under View) shows the layout styles considered side by side
 on the same data with what each is good for, and sets which layout each role opens with. A Merge requests
 tab lists open MRs and those merged in the window: who each waits on (a reviewer, or the
 author when the pipeline failed or there are conflicts) and for how long, its newest
