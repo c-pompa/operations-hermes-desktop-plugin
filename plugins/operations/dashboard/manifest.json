@@ -1,0 +1,13 @@
+{
+  "name": "operations",
+  "label": "Operations",
+  "description": "Operations overview: vitals, today's activity, what needs attention, and hosts, from the metrics collector and kanban",
+  "icon": "Activity",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/operations",
+    "hidden": true
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}

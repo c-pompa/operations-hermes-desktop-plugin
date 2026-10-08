@@ -1,0 +1,75 @@
+name: operations
+version: 0.1.0
+manifest_version: 2
+description: >-
+  Operations page: vitals, today, what needs attention, changes and news,
+  hosts and model pool, request flow, activity, kanban and subagent handoffs
+  (an open card can be assigned, started now or at a set time, or closed),
+  request traces, merge requests with pipeline stages, a topology map with replay and the
+  model router's roles, fleet-standard conformance with host fixes by card or by hand, editable
+  role views, optional model-written Activity summaries, and alerts in Desktop (and optionally Discord) when
+  something new needs attention.
+  Backend routes mount at /api/plugins/operations/; the desktop half (same id)
+  renders the page.
+author: cpompa
+license: MIT
+homepage: https://github.com/c-pompa/operations-hermes-desktop-plugin
+tags: [operations, dashboard, monitoring]
+provides_tools: []
+provides_hooks:
+  - on_kanban_dispatch_tick
+config_schema:
+  conformance_project:
+    type: str
+    default: ""
+    label: Conformance project
+    description: >-
+      GitLab project (group/repo) whose CI job "standard" publishes
+      conformance-report.json, or the path of a local conformance.yaml; the tab
+      checks the hosts it declares, whichever repo you work in. Empty uses
+      ~/.hermes/conformance/conformance.yaml when it exists ("Start a local
+      standard" on the Conformance tab), else only the built-in repo checks.
+  gitlab_host:
+    type: str
+    default: ""
+    label: GitLab host
+    description: Leave empty to use the default host from your glab login.
+  gitlab_token:
+    type: secret
+    env: OPERATIONS_GITLAB_TOKEN
+    label: GitLab token
+    description: >-
+      API token; read_api is enough, except proposing a conformance rule, which opens a
+      merge request and needs api. Leave empty to use your glab login.
+  activity_summaries:
+    type: bool
+    default: false
+    label: Activity summaries
+    description: >-
+      Rewrite Activity entries as readable sentences with a small model. Pick the model under
+      the "Operations activity summaries" auxiliary task; each summary shows which model wrote
+      it and from how many events. Off by default, so the plugin calls no model unless you turn
+      this on.
+  alert_target:
+    type: str
+    default: ""
+    label: Discord alerts
+    description: >-
+      Where the gateway posts a message when something new needs attention: discord for the
+      Discord home channel, discord:<channel> for another, or any other `hermes send` target.
+      Set it in one profile only. Leave empty for alerts in Desktop only.
+  drift_action:
+    type: str
+    default: button
+    choices: [button, automatic, "off"]
+    label: When a host drifts
+    description: >-
+      button: the Conformance tab offers "File a fix card" (or "I'll run it") for a host with
+      failing checks. automatic: the gateway files the card itself and starts it for the profile
+      below, at most once a day per host. off: the tab only shows the failing checks. Cards need a
+      kanban board; without one only "I'll run it" is offered.
+  drift_profile:
+    type: str
+    default: ""
+    label: Profile for automatic fix cards
+    description: The profile that works the cards filed when "When a host drifts" is automatic.
