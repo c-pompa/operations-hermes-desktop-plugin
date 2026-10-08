@@ -1,5 +1,7 @@
 # Operations
 
+A plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent) by [Nous Research](https://nousresearch.com).
+
 ## Pages
 
 - **Overview**: start here. Vitals for the range you pick, an hourly strip of today's requests,
