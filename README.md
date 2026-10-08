@@ -246,19 +246,9 @@ still run.
   person merges it; main is never written directly.
 - A local standard has no repo to review it, so the rule is written into the file.
 
-**Business mode** is detected, never installed. When the Hermes account belongs to an
-organisation with skill sync on (`sync.enabled`):
-
-- The tab names the organisation and your role, and "Propose a rule" can send the rule there
-  instead of opening a merge request.
-- The organisation's copy of the standard is an org skill named after the standard: its
-  `conformance.yaml` gets the rule and its `SKILL.md` is regenerated (text outside the markers is
-  kept). Without an org mirror copy, a new skill is seeded under
-  `<profile>/skills/standards/<name>/`.
-- The rule goes through `hermes sync propose`. The server decides: an owner or admin publishes
-  it, a member's waits for an admin. If the send fails, the edit stays local and
-  `hermes sync propose <name>` sends it later.
-- Proposals are reviewed outside the plugin for now; Hermes has no client call to list them yet.
+**Business mode** (sending rules to a Hermes organisation's shared copy of the standard) is
+switched off in this version, whatever the account or sync settings. Every install runs in single
+user mode.
 
 ### Notifications and alerts
 
@@ -344,7 +334,6 @@ and nothing is created.
 - merge requests proposing a rule (never main)
 - its own files under `<hermes root>/plugin-data/operations/`: `roles.json`, `summaries.json`,
   `fixes.json`
-- in business mode, the standard's org skill when a rule is sent to the organisation
 
 **Package** `plugins/operations/`:
 

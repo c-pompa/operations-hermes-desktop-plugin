@@ -131,6 +131,18 @@ class ProposeRuleTest(unittest.TestCase):
         self.assertFalse([c for c in self.calls if c[1] is not None])
 
 
+class BusinessModeOffTest(unittest.TestCase):
+    """Business mode is switched off in this version: single mode, and a rule cannot go to an org."""
+
+    def test_single_and_refused(self):
+        api._org_cache.update(at=0.0, value=None)
+        self.assertEqual(api.org_mode(fresh=True), {"mode": "single", "org_id": None, "org_name": None,
+                                                    "role": None, "reason": "business mode is not available yet"})
+        with self.assertRaises(HTTPException) as cm:
+            api.propose_to_org("host_rules", {}, "", {})
+        self.assertEqual(cm.exception.status_code, 409)
+
+
 # Hermes dropped org skill sync upstream; org_mode then catches the ImportError and reports single mode
 @unittest.skipUnless(importlib.util.find_spec("tools.skills_sync_client"), "this Hermes has no org skill sync")
 class OrgTest(unittest.TestCase):
@@ -157,6 +169,9 @@ class OrgTest(unittest.TestCase):
             p = mock.patch.object(target, attr, side_effect=value)
             p.start()
             self.addCleanup(p.stop)
+        p = mock.patch.object(api, "BUSINESS_MODE", True)
+        p.start()
+        self.addCleanup(p.stop)
         api._org_cache.update(at=0.0, value=None)
         self.addCleanup(api._org_cache.update, at=0.0, value=None)
 

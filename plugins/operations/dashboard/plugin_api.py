@@ -1582,7 +1582,7 @@ def conformance() -> Dict[str, Any]:
     project = _standard_project() or None
     out: Dict[str, Any] = {"generated_at": time.time(), "project": project, "standard": None, "repo": None,
                            "host_rules": [], "hosts": None, "pipeline": None, "errors": errors,
-                           "org": org_mode(), "local": False}
+                           "org": org_mode() if BUSINESS_MODE else None, "local": False}
     # Optional feature: without a project there is nothing to check, which is not an error.
     if not project:
         return out
@@ -2155,6 +2155,7 @@ def propose_rule(kind: str = Body(..., embed=True), rule: Dict[str, Any] = Body(
 # sends every role the same request through Hermes' own sync client; the sync server decides
 # whether it publishes or waits for an admin, and the page shows what it answered.
 ORG_CHECK_S = 300
+BUSINESS_MODE = False   # off until business mode is finished: always single, even in an org with sync on
 _org_cache: Dict[str, Any] = {"at": 0.0, "value": None}
 
 
@@ -2164,6 +2165,8 @@ def org_mode(fresh: bool = False) -> Dict[str, Any]:
     if not fresh and _org_cache["value"] and time.time() - _org_cache["at"] < ORG_CHECK_S:
         return _org_cache["value"]
     out: Dict[str, Any] = {"mode": "single", "org_id": None, "org_name": None, "role": None, "reason": ""}
+    if not BUSINESS_MODE:
+        return {**out, "reason": "business mode is not available yet"}
     try:
         from tools import skills_sync_client as ssc
         from tools.skills_sync_client_org import resolve_org_identity
