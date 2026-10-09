@@ -67,6 +67,8 @@ import {
 
 const ID = 'operations'
 const PATH = '/operations'
+// Off until business mode is finished: everyone sees the first role, with no View as picker or role editor
+const VIEW_AS = false
 const REFRESH_MS = 30_000
 
 // set inside register(), the only place the plugin ctx exists
@@ -3839,7 +3841,7 @@ function TopologyPage({ sel: initial, when = {}, remember }) {
             })
           }),
           !issues.some(i => !i.quiet) ? jsx('span', { className: 'text-[0.6875rem] text-(--ui-text-quaternary)', children: 'No issues' }) : null,
-          jsx('span', { className: 'ml-auto text-[0.6875rem] text-(--ui-text-quaternary)', children: `${LAYOUT_NAMES[layout] || layout}${role && !chosen ? ` · ${role.name} default` : ''}` }),
+          jsx('span', { className: 'ml-auto text-[0.6875rem] text-(--ui-text-quaternary)', children: `${LAYOUT_NAMES[layout] || layout}${VIEW_AS && role && !chosen ? ` · ${role.name} default` : ''}` }),
           jsxs('div', {
             className: 'relative',
             children: [
@@ -3850,13 +3852,14 @@ function TopologyPage({ sel: initial, when = {}, remember }) {
                 children: 'View'
               }),
               view ? jsxs('div', {
-                className: 'absolute right-0 z-10 mt-1 w-[min(26rem,calc(100vw-2rem))] space-y-2 rounded-md border border-(--ui-stroke-secondary) p-3 text-xs shadow-lg',
-                style: { background: 'var(--ui-bg, var(--chrome-bg))' },
+                className: 'absolute right-0 z-10 mt-1 space-y-2 rounded-md border border-(--ui-stroke-secondary) p-3 text-xs shadow-lg',
+                // inline: Desktop's stylesheet has only the classes it uses itself, and no arbitrary widths
+                style: { width: 'min(26rem, calc(100vw - 2rem))', background: 'var(--ui-bg, var(--chrome-bg))' },
                 children: [
                   jsx('div', { className: 'font-medium', children: 'View' }),
                   jsx(Seg, { options: LAYOUTS.map(([k, name]) => [k, name]), value: layout, onChange: setLayout }),
                   jsxs('div', {
-                    className: 'flex flex-wrap items-center gap-3',
+                    className: 'grid grid-cols-2 gap-x-3 gap-y-2',
                     children: [
                       check('Collapse to one orchestrator', collapse, setCollapse, !flow, flow ? 'Fold every profile into one node' : 'Area grouping and Router switchboard only'),
                       check('Show each role', eachRole, setEachRole, layout !== 'area', layout === 'area' ? 'Split the router into its role aliases, as a ring' : 'Area grouping only; the switchboard always shows each role'),
@@ -5200,7 +5203,7 @@ function OperationsPage() {
   // bumped when Notifications marks alerts read, so the tab's unread count redraws
   const [, setReads] = useState(0)
   const list = roles?.roles || []
-  const role = list.find(r => r.id === roleId) || list[0] || null
+  const role = (VIEW_AS && list.find(r => r.id === roleId)) || list[0] || null
   const viewAs = id => { setRoleId(id); try { api.storage.set('role', id) } catch {} }
   const tabs = [
     { id: 'overview', label: 'Overview' },
@@ -5255,7 +5258,7 @@ function OperationsPage() {
           })
         ),
         jsx('span', { key: 'gap', className: 'ml-auto' }),
-        role ? jsxs(Select, {
+        VIEW_AS && role ? jsxs(Select, {
           key: 'role',
           value: role.id,
           onValueChange: viewAs,
@@ -5264,7 +5267,7 @@ function OperationsPage() {
             jsx(SelectContent, { children: list.map(r => jsx(SelectItem, { key: r.id, value: r.id, children: `View as ${r.name}` })) })
           ]
         }) : null,
-        roles ? jsx('button', {
+        VIEW_AS && roles ? jsx('button', {
           type: 'button', key: 'edit', onClick: () => { haptic('tap'); setEditing(true) },
           className: 'rounded px-2 py-0.5 text-[0.6875rem] text-(--ui-text-quaternary) hover:bg-(--chrome-action-hover)',
           children: 'Edit roles'

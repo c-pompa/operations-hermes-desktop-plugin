@@ -134,3 +134,9 @@ console.log(JSON.stringify({
         self.assertEqual(out["events"]["closed"], 0)
         self.assertIn("served 90%", out["opened"])
         self.assertEqual(out["events"]["opened"], 3)
+
+
+class ViewMenuTest(unittest.TestCase):
+    def test_width_is_inline_since_desktop_has_no_arbitrary_width_classes(self):
+        self.assertNotIn("w-[", JS)
+        self.assertIn("width: 'min(26rem, calc(100vw - 2rem))'", JS)

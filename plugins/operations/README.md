@@ -282,10 +282,8 @@ copy of the plugin, so for a profile using `~/.hermes/plugins` the step shows th
 
 ### Roles
 
-View the page as Everyone, SRE, DevOps, AI and MLOps, or Cloud and platform. Each role is a job
-description plus what it means for the page: the Activity kinds it watches first and the layout
-Topology opens with. "Edit roles" changes, adds, deletes or resets them; edits are shared across
-this Hermes install, and each viewer's pick is remembered in their own Desktop.
+Viewing the page as a role (SRE, DevOps and so on) and editing roles is a business feature and is
+not available yet; everyone sees the Everyone view.
 
 ## Settings
 
