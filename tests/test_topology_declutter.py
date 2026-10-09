@@ -140,3 +140,6 @@ class ViewMenuTest(unittest.TestCase):
     def test_width_is_inline_since_desktop_has_no_arbitrary_width_classes(self):
         self.assertNotIn("w-[", JS)
         self.assertIn("width: 'min(26rem, calc(100vw - 2rem))'", JS)
+
+    def test_background_is_opaque_since_desktop_has_no_chrome_bg(self):
+        self.assertNotIn("var(--chrome-bg)", JS)

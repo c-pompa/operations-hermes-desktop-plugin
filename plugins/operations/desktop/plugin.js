@@ -3854,7 +3854,7 @@ function TopologyPage({ sel: initial, when = {}, remember }) {
               view ? jsxs('div', {
                 className: 'absolute right-0 z-10 mt-1 space-y-2 rounded-md border border-(--ui-stroke-secondary) p-3 text-xs shadow-lg',
                 // inline: Desktop's stylesheet has only the classes it uses itself, and no arbitrary widths
-                style: { width: 'min(26rem, calc(100vw - 2rem))', background: 'var(--ui-bg, var(--chrome-bg))' },
+                style: { width: 'min(26rem, calc(100vw - 2rem))', background: 'var(--ui-bg, #0d1117)' },
                 children: [
                   jsx('div', { className: 'font-medium', children: 'View' }),
                   jsx(Seg, { options: LAYOUTS.map(([k, name]) => [k, name]), value: layout, onChange: setLayout }),
