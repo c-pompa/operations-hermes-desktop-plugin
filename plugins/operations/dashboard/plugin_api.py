@@ -12,7 +12,7 @@ not exist (no metrics collector, no kanban board yet) is replaced by an empty
 one, so its numbers read as empty and errors["metrics"] / errors["kanban"] say why.
 
 GET /changes?hours=N returns what changed in the window: MRs merged on
-GitLab (read with the token glab stores, or GITLAB_TOKEN) and model loads and
+GitLab (read with the gitlab_token setting, or GITLAB_TOKEN) and model loads and
 unloads in the pool. It is a separate route so a slow GitLab never holds up
 /overview.
 
@@ -166,12 +166,6 @@ ACTIVITY_LIMIT = 25
 ACTIVITY_SCAN = 2000
 KANBAN_ACTIVITY_KINDS = ("created", "completed", "crashed", "blocked", "timed_out", "gave_up")
 SEV_RANK = {"crit": 0, "warn": 1, "info": 2}
-# glab's config: GLAB_CONFIG_DIR, else its macOS or XDG location, whichever exists.
-_GLAB_CONFIG = next((d / "config.yml" for d in (
-    Path(os.environ["GLAB_CONFIG_DIR"]) if os.environ.get("GLAB_CONFIG_DIR") else None,
-    Path.home() / "Library" / "Application Support" / "glab-cli",
-    Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "glab-cli",
-) if d is not None and (d / "config.yml").exists()), Path.home() / ".config" / "glab-cli" / "config.yml")
 CHANGES_LIMIT = 40
 MRS_LIMIT = 40
 # Pool snapshots arrive about once a minute; a longer silence is the device being away,
@@ -485,56 +479,21 @@ def _settings() -> Dict[str, Any]:
     return {**_default_settings(), **_settings_in(load_config())}
 
 
-def _glab_lines() -> List[str]:
-    try:
-        return _GLAB_CONFIG.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return []
-
-
 def _gitlab_host() -> str:
-    """GITLAB_HOST, else the gitlab_host setting, else glab's default "host:"."""
-    host = os.environ.get("GITLAB_HOST") or _settings().get("gitlab_host")
-    if host:
-        return host
-    for line in _glab_lines():
-        if line.startswith("host:"):
-            return line[len("host:"):].strip().strip("\"'")
-    return ""
+    """GITLAB_HOST, else the gitlab_host setting."""
+    return os.environ.get("GITLAB_HOST") or _settings().get("gitlab_host") or ""
 
 
 def _gitlab_token() -> str:
-    """The gitlab_token setting, else GITLAB_TOKEN, else glab's token for the host."""
-    tok = get_secret("OPERATIONS_GITLAB_TOKEN") or os.environ.get("GITLAB_TOKEN", "")
-    if tok:
-        return tok
-    host = _gitlab_host()
-    if not host:
-        return ""
-    lines = _glab_lines()
-    # No PyYAML in the dashboard's bundled Python: find "<host>:" under "hosts:", then the
-    # first "token:" indented deeper than it, stopping where the host's block ends.
-    host_indent = None
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        indent = len(line) - len(line.lstrip())
-        if host_indent is None:
-            if indent > 0 and stripped == f"{host}:":
-                host_indent = indent
-        elif indent <= host_indent:
-            break
-        elif stripped.startswith("token:"):
-            return stripped[len("token:"):].strip().strip("\"'")
-    return ""
+    """The gitlab_token setting, else GITLAB_TOKEN."""
+    return get_secret("OPERATIONS_GITLAB_TOKEN") or os.environ.get("GITLAB_TOKEN", "")
 
 
 def _gitlab(path: str, body: Optional[Dict[str, Any]] = None) -> str:
     """GET, or POST with a JSON body (the rule proposal's only writes)."""
     host, tok = _gitlab_host(), _gitlab_token()
     if not host or not tok:
-        raise RuntimeError("no GitLab login: run `glab auth login`, or set GITLAB_HOST and GITLAB_TOKEN")
+        raise RuntimeError("no GitLab login: set GitLab host and GitLab token in the plugin's settings, or GITLAB_HOST and GITLAB_TOKEN")
     headers = {"PRIVATE-TOKEN": tok}
     if body is not None:
         headers["Content-Type"] = "application/json"

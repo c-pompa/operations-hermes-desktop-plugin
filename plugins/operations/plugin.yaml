@@ -33,14 +33,14 @@ config_schema:
     type: str
     default: ""
     label: GitLab host
-    description: Leave empty to use the default host from your glab login.
+    description: Your GitLab server, such as gitlab.com. GITLAB_HOST overrides it.
   gitlab_token:
     type: secret
     env: OPERATIONS_GITLAB_TOKEN
     label: GitLab token
     description: >-
       API token; read_api is enough, except proposing a conformance rule, which opens a
-      merge request and needs api. Leave empty to use your glab login.
+      merge request and needs api. Leave empty to use GITLAB_TOKEN.
   activity_summaries:
     type: bool
     default: false

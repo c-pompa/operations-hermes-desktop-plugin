@@ -99,37 +99,27 @@ class ChangesTest(unittest.TestCase):
         self.assertIn("no GitLab login", api.changes(2)["errors"]["gitlab"])
 
 
-class GlabTokenTest(unittest.TestCase):
-    def test_reads_only_this_hosts_token(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            cfg = Path(tmp) / "config.yml"
-            cfg.write_text(
-                "host: gitlab.example.com\n"
-                "hosts:\n"
-                "    gitlab.com:\n"
-                "        token: wrong-one\n"
-                "    gitlab.example.com:\n"
-                "        api_host: gitlab.example.com\n"
-                "        # a comment\n"
-                "        token: 'right-one'\n"
-                "    localhost:8929:\n"
-                "        token: also-wrong\n")
-            saved = (api._GLAB_CONFIG, api.os.environ.pop("GITLAB_TOKEN", None), api._settings, api.get_secret)
-            api._GLAB_CONFIG, api._settings, api.get_secret = cfg, dict, (lambda name: None)
-            try:
-                self.assertEqual(api._gitlab_token(), "right-one")
-                cfg.write_text("host: gitlab.example.com\nhosts:\n    gitlab.example.com:\n        user: x\n    other:\n        token: no\n")
-                self.assertEqual(api._gitlab_token(), "")
-                # no default host and no settings: nothing to log in to
-                cfg.write_text("hosts:\n    gitlab.example.com:\n        token: t\n")
-                self.assertEqual(api._gitlab_host(), "")
-                # the plugin's own token setting wins over glab
-                api.get_secret = lambda name: "from-settings" if name == "OPERATIONS_GITLAB_TOKEN" else None
-                self.assertEqual(api._gitlab_token(), "from-settings")
-            finally:
-                api._GLAB_CONFIG, api._settings, api.get_secret = saved[0], saved[2], saved[3]
-                if saved[1] is not None:
-                    api.os.environ["GITLAB_TOKEN"] = saved[1]
+class GitLabLoginTest(unittest.TestCase):
+    def test_reads_only_its_own_settings_and_env(self):
+        saved = ({k: api.os.environ.pop(k, None) for k in ("GITLAB_HOST", "GITLAB_TOKEN")}, api._settings, api.get_secret)
+        api._settings, api.get_secret = dict, (lambda name: None)
+        try:
+            # nothing configured: no login, whatever other tools have stored
+            self.assertEqual((api._gitlab_host(), api._gitlab_token()), ("", ""))
+            api.os.environ.update(GITLAB_HOST="gitlab.example.com", GITLAB_TOKEN="from-env")
+            self.assertEqual((api._gitlab_host(), api._gitlab_token()), ("gitlab.example.com", "from-env"))
+            # the plugin's own token setting wins over GITLAB_TOKEN
+            api.get_secret = lambda name: "from-settings" if name == "OPERATIONS_GITLAB_TOKEN" else None
+            self.assertEqual(api._gitlab_token(), "from-settings")
+            del api.os.environ["GITLAB_HOST"]
+            api._settings = lambda: {"gitlab_host": "gitlab.other.example"}
+            self.assertEqual(api._gitlab_host(), "gitlab.other.example")
+        finally:
+            for k, v in saved[0].items():
+                api.os.environ.pop(k, None)
+                if v is not None:
+                    api.os.environ[k] = v
+            api._settings, api.get_secret = saved[1], saved[2]
 
 
 if __name__ == "__main__":

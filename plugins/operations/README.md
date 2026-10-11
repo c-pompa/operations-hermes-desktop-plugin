@@ -328,8 +328,8 @@ All optional, in Capabilities > Plugins > Operations (the gear), stored under
 | Setting | Key | Default | What it does |
 | --- | --- | --- | --- |
 | Conformance project | `conformance_project` | empty | `group/repo` or a local `conformance.yaml` path; adds a fleet standard. Empty uses `~/.hermes/conformance/conformance.yaml` if it exists |
-| GitLab host | `gitlab_host` | glab default | overrides your `glab auth login` host (or `GITLAB_HOST`) |
-| GitLab token | `gitlab_token` | glab token | `read_api` to read; `api` to propose a rule (or `GITLAB_TOKEN`) |
+| GitLab host | `gitlab_host` | empty | your GitLab server, such as `gitlab.com` (or `GITLAB_HOST`) |
+| GitLab token | `gitlab_token` | empty | `read_api` to read; `api` to propose a rule (or `GITLAB_TOKEN`) |
 | Activity summaries | `activity_summaries` | off | model-written Activity sentences |
 | Discord alerts | `alert_target` | empty | `discord`, `discord:<channel>`, or any `hermes send` target |
 | When a host drifts | `drift_action` | `button` | `button` offers a fix card or "I'll run it"; `automatic` files and starts the card for `drift_profile` at most once a day per host; `off` shows the checks only |
