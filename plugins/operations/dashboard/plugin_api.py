@@ -21,9 +21,13 @@ each with its reviewers and its newest pipeline's stages (passed, failed,
 running or skipped). Read only.
 
 GET /flow?hours=N returns the window's requests as links from entry point
-(platform) to profile to model to what served them (the pool device, or the
-cloud provider when no device did): each distinct path with its count, each
-node's count, errors and p95, and requests per hour split by what served them.
+(platform) to profile to model to what served them (the pool device, else the
+provider it was sent to, or "no answer" for a failed call nothing answered):
+each distinct path with its count, each node's count, errors and p95, and
+requests per hour split by what served them.
+
+POST /trace/{session}/explain returns a plain-language reading of a session's
+trace, written on request by the "operations_summary" model. Nothing is stored.
 
 GET /activity?hours=N returns the window's activity log, grouped per hour:
 errors, gateway state changes, kanban task events and host check status
@@ -187,6 +191,10 @@ TIMELINE_CHANGES = 200
 # A gateway that stops and is back in some state within this long was restarted: one change, not two.
 RESTART_S = 180
 USUAL_MIN_CALLS = 5  # fewer similar calls than this and a call has no typical time
+# Hermes stops waiting for a model call after HERMES_API_TIMEOUT (default 1800s; for a local endpoint the
+# stream read timeout is raised to match). A failed call that ended on a multiple of it timed out.
+API_TIMEOUT_S = 1800
+TIMEOUT_SLACK_S = 30
 # Run errors are excerpts; the kanban board has the full text.
 RUN_ERROR_CHARS = 200
 LOG_RAW = 5
@@ -277,14 +285,47 @@ def today(m: sqlite3.Connection, k: sqlite3.Connection, now: float) -> List[Dict
     return hours
 
 
+# a finding about a model router role names it, e.g. "compression role hermes/compressor has no loaded model"
+_ROLE_IN_TEXT = re.compile(r"\brole (\S+/\S+)")
+
+
+# a finding about a session names it by the start of its id, e.g. "session 20261006_101700_96faea… at 86k tok"
+_SESSION_IN_TEXT = re.compile(r"\bsession (\S{8,}?)(?:…|\s|$)")
+
+
+def _session_action(m: sqlite3.Connection, text: Optional[str], action: Optional[str], before: float) -> Optional[str]:
+    """A finding's "check for a retry loop", corrected when the session it names had model calls time out: a session
+    whose calls keep timing out also burns input for little output, but no retry loop of its own is to blame."""
+    found = "retry loop" in (action or "") and _SESSION_IN_TEXT.search(text or "")
+    s = found and find_session(m, found[1], before)
+    if not s:
+        return action
+    out = [r for r in m.execute(f"SELECT {_cols(m, 'model', 'duration_s')} FROM records WHERE session_id=? AND kind='error'",
+                                (s["session_id"],)) if _timed_out(r["duration_s"])]
+    if not out:
+        return action
+    models = ", ".join(sorted({r["model"] or "no model" for r in out}))
+    return (f"Not a retry loop: {len(out)} call{'s' if len(out) != 1 else ''} to {models} got no answer within"
+            f" {_dur(API_TIMEOUT_S)} and timed out (failed calls add no tokens). The model is slow or queued; Trace"
+            " shows how busy it was.")
+
+
 def attention(m: sqlite3.Connection, k: sqlite3.Connection, now: float) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
     snap = m.execute("SELECT MAX(ts) FROM health_findings").fetchone()[0]
     if snap is not None:
         for r in m.execute(
                 "SELECT rule, sev, text, action FROM health_findings WHERE ts=? AND sev IN ('crit', 'warn')", (snap,)):
+            # every check that still sees a finding writes it again; it started at the first check
+            # after the last one without it
+            since = m.execute(
+                "SELECT MIN(ts) FROM health_findings WHERE rule=:rule AND ts > COALESCE((SELECT MAX(ts) FROM"
+                " health_findings WHERE ts NOT IN (SELECT ts FROM health_findings WHERE rule=:rule)), 0)",
+                {"rule": r["rule"]}).fetchone()[0]
+            role = _ROLE_IN_TEXT.search(r["text"] or "")
             items.append({"key": f"health:{r['rule']}", "sev": r["sev"], "source": f"health {r['rule']}", "text": r["text"],
-                          "action": r["action"], "ts": snap})
+                          "action": _session_action(m, r["text"], r["action"], since), "ts": since,
+                          **({"role": role[1]} if role else {})})
     for r in m.execute(
             "SELECT host, platform, label, error, MAX(ts) AS ts FROM records"
             " WHERE kind='gateway_status' AND ts>=? GROUP BY platform", (now - 86400,)):
@@ -663,13 +704,59 @@ def merge_requests(hours: int = Query(24, ge=1, le=168)) -> Dict[str, Any]:
     return {"generated_at": now, "hours": hours, "items": items, "errors": errors}
 
 
+def _served(device: Optional[str], provider: Optional[str], failed: bool) -> str:
+    """What served a call: its pool device, else the provider it was sent to. A failed call with no device got no
+    answer from anything; its provider only says where it went (behind a router that is a name like "custom")."""
+    if device:
+        return device
+    if failed:
+        return f"no answer ({provider})" if provider else "no answer"
+    return provider or "unknown"
+
+
+def _timed_out(d: Optional[float]) -> bool:
+    """A failed call that ended on a multiple of the API timeout gave up waiting (Hermes counts a retry's time from
+    the first attempt, so a second timeout ends near twice it)."""
+    return d is not None and d >= API_TIMEOUT_S - TIMEOUT_SLACK_S and min(d % API_TIMEOUT_S, -d % API_TIMEOUT_S) <= TIMEOUT_SLACK_S
+
+
+def _load_at(m: sqlite3.Connection, model: str, spans: List[tuple]) -> List[Dict[str, Any]]:
+    """How busy a model was during each (start, end, session) span when a call to it failed: how many other
+    sessions had a call to it in flight, and what served the ones of those that got an answer, in how long (its own
+    attempt's time: Hermes times a retry from the first attempt, which failed under the same request id)."""
+    lo, hi = min(s for s, _, _ in spans), max(e for _, e, _ in spans)
+    rows = [dict(r) for r in m.execute(
+        f"SELECT kind, session_id, ts - COALESCE(duration_s, 0) AS start, ts, device, duration_s, api_request_id FROM (SELECT"
+        f" {_cols(m, 'kind', 'session_id', 'ts', 'duration_s', 'device', 'model', 'api_request_id')} FROM records"
+        f" WHERE kind IN ('api', 'error') AND model=? AND ts>=? AND ts<?) ORDER BY ts", (model, lo, hi + 86400)) if r["start"] <= hi]
+    tried: Dict[str, float] = {}  # request id -> time its failed attempts took
+    for r in rows:
+        if r["api_request_id"] and r["duration_s"] is not None:
+            if r["kind"] == "api":
+                r["duration_s"] -= tried.get(r["api_request_id"], 0.0)
+            else:
+                tried[r["api_request_id"]] = r["duration_s"]
+    out = []
+    for s, e, sid in spans:
+        others = [r for r in rows if r["start"] <= e and r["ts"] >= s and r["session_id"] != sid]
+        answered = [r for r in others if r["kind"] == "api" and r["device"]]
+        by: Dict[str, int] = {}
+        for r in answered:
+            by[r["device"]] = by.get(r["device"], 0) + 1
+        out.append({"busy": len({r["session_id"] for r in others}), "answered_n": len(answered),
+                    "answered_by": max(by, key=by.get) if by else None,
+                    "answered_s": statistics.median(r["duration_s"] for r in answered if r["duration_s"] is not None)
+                    if any(r["duration_s"] is not None for r in answered) else None})
+    return out
+
+
 def request_flow(m: sqlite3.Connection, since: float, until: float) -> Dict[str, Any]:
     # profile and provider came with later collectors; an older metrics.db reads them as unknown.
     have = {r[1] for r in m.execute("PRAGMA table_info(records)")}
     profile, provider = (c if c in have else "NULL" for c in ("profile", "provider"))
     # A failed call is recorded as kind='error'; those from a client (with a platform) count as
     # requests that failed. The router's own errors have no platform and stay out of Flow.
-    rows = m.execute(f"SELECT ts, platform, {profile}, model, device, {provider}, duration_s,"
+    rows = m.execute(f"SELECT ts, platform, {profile}, model, device, {provider}, duration_s, kind='error',"
                      " kind='error' OR COALESCE(error, '')!=''"
                      " FROM records WHERE (kind='api' OR (kind='error' AND COALESCE(platform, '')!='')) AND ts>=? AND ts<?",
                      (since, until)).fetchall()
@@ -682,8 +769,8 @@ def request_flow(m: sqlite3.Connection, since: float, until: float) -> Dict[str,
     nodes: Dict[str, Dict[str, Any]] = {}
     durations: Dict[str, List[float]] = {}
     paths: Dict[tuple, int] = {}
-    for ts, platform, prof, model, device, prov, dur, err in rows:
-        labels = (platform or "unknown", prof or "no profile", model or "no model", device or prov or "unknown")
+    for ts, platform, prof, model, device, prov, dur, lost, err in rows:
+        labels = (platform or "unknown", prof or "no profile", model or "no model", _served(device, prov, lost))
         ids = [f"{c}:{label}" for c, label in zip(FLOW_COLUMNS, labels)]
         for col, label, nid in zip(FLOW_COLUMNS, labels, ids):
             n = nodes.setdefault(nid, {"id": nid, "col": col, "label": label, "requests": 0, "errors": 0})
@@ -692,6 +779,7 @@ def request_flow(m: sqlite3.Connection, since: float, until: float) -> Dict[str,
             if dur is not None:
                 durations.setdefault(nid, []).append(dur)
         nodes[ids[-1]]["pool_device"] = bool(device)
+        nodes[ids[-1]]["no_answer"] = bool(lost and not device)
         paths[tuple(ids)] = paths.get(tuple(ids), 0) + 1
         h = min(len(hourly) - 1, int((ts - start) // 3600))
         by = hourly[h]["by"]
@@ -733,19 +821,35 @@ def flow(hours: int = Query(24, ge=1, le=168), start: Optional[float] = None) ->
 
 
 def error_groups(m: sqlite3.Connection, since: float, until: float) -> List[Dict[str, Any]]:
-    """The window's failed calls grouped by what failed and where, most first, newest session first."""
+    """The window's failed calls grouped by what failed and where, most first, newest session first. A client's
+    group also says how many timed out, and how busy its model was then: the median count of other sessions with a
+    call to it in flight while each failed one waited, and what served those that got an answer."""
     groups: Dict[tuple, Dict[str, Any]] = {}
-    for r in m.execute(f"SELECT ts, {_cols(m, 'host', 'device', 'provider', 'platform', 'profile', 'model', 'event', 'error', 'session_id')}"
+    spans: Dict[tuple, List[tuple]] = {}
+    for r in m.execute(f"SELECT ts, {_cols(m, 'host', 'device', 'provider', 'platform', 'profile', 'model', 'event', 'error', 'session_id', 'duration_s')}"
                        " FROM records WHERE kind='error' AND ts>=? AND ts<? ORDER BY ts DESC", (since, until)):
-        served = r["device"] or r["provider"]
+        # the router's own errors (no platform) are not a client's calls and keep the provider they name
+        served = _served(r["device"], r["provider"], True) if r["platform"] else r["device"] or r["provider"]
         key = (r["host"], r["platform"], r["profile"], r["model"], served, r["event"], r["error"])
         g = groups.setdefault(key, {"host": r["host"], "platform": r["platform"], "profile": r["profile"], "model": r["model"],
-                                    "served": served, "event": r["event"], "error": r["error"], "count": 0,
+                                    "served": served, "no_answer": bool(r["platform"] and not r["device"]),
+                                    "event": r["event"], "error": r["error"], "count": 0, "timeouts": 0,
                                     "first": r["ts"], "last": r["ts"], "sessions": []})
         g["count"] += 1
+        g["timeouts"] += _timed_out(r["duration_s"])
         g["first"] = r["ts"]
         if r["session_id"] and r["session_id"] not in g["sessions"]:
             g["sessions"].append(r["session_id"])
+        spans.setdefault(key, []).append((r["ts"] - (r["duration_s"] or 0), r["ts"], r["session_id"]))
+    for key, g in groups.items():
+        if g["platform"] and g["model"]:
+            load = _load_at(m, g["model"], spans[key])
+            by: Dict[str, int] = {}
+            for x in load:
+                if x["answered_by"]:
+                    by[x["answered_by"]] = by.get(x["answered_by"], 0) + 1
+            g["busy"] = round(statistics.median(x["busy"] for x in load))
+            g["answered_by"] = max(by, key=by.get) if by else None
     return sorted(groups.values(), key=lambda g: -g["count"])
 
 
@@ -808,17 +912,34 @@ def session_trace(m: sqlite3.Connection, sid: str) -> Dict[str, Any]:
     """One session's calls in order (failed ones included), its subagents, and its parent."""
     cols = _cols(m, "kind", "ts", "duration_s", "host", "turn_id", "platform", "profile", "model", "device", "provider",
                  "ttft_s", "tps", "input_tokens", "output_tokens", "cache_read_tokens", "reasoning_tokens",
-                 "finish_reason", "error")
+                 "finish_reason", "error", "api_request_id")
     rows = m.execute(f"SELECT {cols} FROM records WHERE session_id=? AND kind IN ('api', 'error') ORDER BY ts LIMIT ?",
                      (sid, TRACE_CALLS + 1)).fetchall()
     turns: Dict[str, int] = {}
     calls = [{"start": r["ts"] - (r["duration_s"] or 0), "end": r["ts"], "duration_s": r["duration_s"],
               "turn": turns.setdefault(r["turn_id"] or "", len(turns) + 1), "model": r["model"],
-              "served": r["device"] or r["provider"] or "unknown", "pool_device": bool(r["device"]), "host": r["host"],
+              "served": _served(r["device"], r["provider"], r["kind"] == "error"), "pool_device": bool(r["device"]),
+              "no_answer": r["kind"] == "error" and not r["device"], "via": r["provider"], "host": r["host"],
               "ttft_s": r["ttft_s"], "tps": r["tps"], "input_tokens": r["input_tokens"], "output_tokens": r["output_tokens"],
               "cache_read_tokens": r["cache_read_tokens"], "reasoning_tokens": r["reasoning_tokens"],
-              "finish_reason": r["finish_reason"], "error": r["error"] or (None if r["kind"] == "api" else "failed")}
+              "finish_reason": r["finish_reason"], "error": r["error"] or (None if r["kind"] == "api" else "failed"),
+              "request": r["api_request_id"]}
              for r in rows[:TRACE_CALLS]]
+    # Hermes retries a failed call under the same request id and times each attempt from the first, so the
+    # attempts of one request overlap: each is redrawn from where the one before it ended.
+    last: Dict[Any, Dict[str, Any]] = {}
+    attempts: Dict[int, int] = {}  # by the index of a request's first attempt
+    for i, c in enumerate(calls):
+        key = c.pop("request") or (c["turn"], round(c["start"]))
+        prev = last.get(key)
+        c["first"], c["attempt"] = (prev["first"], prev["attempt"] + 1) if prev else (i, 1)
+        if prev and c["duration_s"] is not None:
+            c["start"] = max(c["start"], prev["end"])
+            c["duration_s"] = c["end"] - c["start"]
+        last[key] = c
+        attempts[c["first"]] = c["attempt"]
+    for c in calls:
+        c["attempts"] = attempts[c["first"]]
     pcol = _cols(m, "profile")
     parent = m.execute("SELECT parent_session_id FROM records WHERE kind='subagent_stop' AND session_id=? LIMIT 1",
                        (sid,)).fetchone()
@@ -862,7 +983,11 @@ def _why(m: sqlite3.Connection, sid: str, calls: List[Dict[str, Any]]) -> List[s
         c["usual_s"] = statistics.median(durs) if len(durs) >= USUAL_MIN_CALLS else None
     out = []
     span = max(c["end"] for c in calls) - min(c["start"] for c in calls)
-    busy = sum(c["duration_s"] or 0 for c in calls)
+    # the time any call was running: calls that overlap (parallel tools, subagents) count once
+    busy, until = 0.0, -math.inf
+    for c in sorted(calls, key=lambda c: c["start"]):
+        busy += max(0.0, c["end"] - max(c["start"], until))
+        until = max(until, c["end"])
     if span > 0:
         out.append(f"Model calls took {_dur(busy)} of the session's {_dur(span)} ({round(100 * min(busy, span) / span)}%);"
                    " the rest was between calls: tools, a person, or waiting to be picked up.")
@@ -880,9 +1005,58 @@ def _why(m: sqlite3.Connection, sid: str, calls: List[Dict[str, Any]]) -> List[s
         out.append(f"Call {c['turn']}.{i} took {_dur(c['duration_s'])}, {ratio:.1f}x the usual {_dur(med)}"
                    f" for {c['model']} on {c['served']} at that output length"
                    + (f"; its first token came after {_dur(c['ttft_s'])}." if c["ttft_s"] is not None else "."))
-    failed = sum(bool(c["error"]) for c in calls)
-    if failed:
-        out.append(f"{failed} call{'s' if failed != 1 else ''} failed.")
+    out += _failures(m, sid, calls)
+    return out
+
+
+def _failures(m: sqlite3.Connection, sid: str, calls: List[Dict[str, Any]]) -> List[str]:
+    """What the session's failed calls ran into, as sentences for _why and each failed call's "context": whether
+    it timed out, whether a retry got the answer, and how busy its model was while it waited."""
+    failed = [(i, c) for i, c in enumerate(calls) if c["error"]]
+    if not failed:
+        return []
+    name = lambda i: f"call {calls[i]['turn']}.{i + 1}"
+    final = {c["first"]: c for c in calls}  # each request's last attempt
+    for model in {c["model"] for _, c in failed if c["model"]}:
+        mine = [c for _, c in failed if c["model"] == model]
+        for c, load in zip(mine, _load_at(m, model, [(c["start"], c["end"], sid) for c in mine])):
+            c.update(load)
+    for i, c in failed:
+        c["timed_out"] = _timed_out(c["duration_s"])
+        ctx = ([f"Timed out: no answer within {_dur(API_TIMEOUT_S)}, Hermes' limit for a model call (HERMES_API_TIMEOUT)."
+                " The model was slow or queued rather than broken."] if c["timed_out"] else [])
+        last = final[c["first"]]
+        if c["attempts"] > 1:
+            ctx.append(f"Attempt {c['attempt']} of {c['attempts']}; "
+                       + (f"{name(calls.index(last))} got the answer." if not last["error"] else "every attempt failed."))
+        if c.get("busy"):
+            ctx.append(f"{c['busy']} other session{'s' if c['busy'] != 1 else ''} had {c['model']} calls in flight while it waited.")
+        if c.get("answered_by"):
+            ctx.append(f"Those that got an answer were served by {c['answered_by']}"
+                       + (f" and took a median {_dur(c['answered_s'])}." if c["answered_s"] is not None else "."))
+        c["context"] = ctx
+    out = []
+    retried = [i for i, c in failed if not final[c["first"]]["error"]]
+    lost = {c["first"] for _, c in failed if final[c["first"]]["error"]}
+    if retried:
+        names = [name(i) for i in retried]
+        listed = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+        out.append(f"{listed[0].upper()}{listed[1:]} got no answer and"
+                   f" {'were' if len(retried) > 1 else 'was'} retried; a later attempt got it.")
+    if lost:
+        out.append(f"{len(lost)} request{'s' if len(lost) != 1 else ''} failed on every attempt.")
+    timeouts = sum(c["timed_out"] for _, c in failed)
+    if timeouts:
+        out.append(f"{'All' if timeouts == len(failed) else f'{timeouts} of the'} {len(failed)} failed attempts timed out with no answer after {_dur(API_TIMEOUT_S)},"
+                   " Hermes' limit for a model call: the model was slow or queued, not broken." if len(failed) > 1 else
+                   f"It timed out with no answer after {_dur(API_TIMEOUT_S)}, Hermes' limit for a model call: the model"
+                   " was slow or queued, not broken.")
+    busiest = max((c for _, c in failed), key=lambda c: c.get("busy") or 0)
+    if busiest.get("busy"):
+        out.append(f"While {'they' if len(failed) > 1 else 'it'} waited, {'up to ' if len(failed) > 1 else ''}{busiest['busy']}"
+                   f" other session{'s' if busiest['busy'] != 1 else ''} had {busiest['model']} calls in flight"
+                   + (f"; those answered were served by {busiest['answered_by']}" if busiest.get("answered_by") else "")
+                   + (f" in a median {_dur(busiest['answered_s'])}." if busiest.get("answered_s") is not None else "."))
     return out
 
 
@@ -913,13 +1087,66 @@ def trace_session(session_id: str) -> Dict[str, Any]:
     return out
 
 
+EXPLAIN_CALLS = 60  # call lines sent to the model: the failed and slow ones first
+_EXPLAIN_PROMPT = (
+    "You explain one AI agent session's model calls to the engineer who runs the machines serving them. "
+    "You get measured facts: the session, an analysis already worked out from the metrics, and its calls. "
+    "In at most five short plain sentences say what happened, the most likely cause, and one thing to try. "
+    "Use only the facts given and say so when they do not show a cause. No markdown, no lists.")
+
+
+@router.post("/trace/{session_id}/explain")
+def trace_explain(session_id: str) -> Dict[str, Any]:
+    """A plain-language reading of a session's trace, written on request by the model set for the
+    "operations_summary" auxiliary task from the facts the Trace page shows. Nothing is cached or written."""
+    t = trace_session(session_id)
+    if t["errors"].get("metrics") or t["errors"].get("trace") or not t.get("calls"):
+        raise HTTPException(404, "No model calls recorded for this session.")
+    calls = t["calls"]
+    named = [(f"{c['turn']}.{i + 1}", c) for i, c in enumerate(calls)]
+    named.sort(key=lambda x: (not x[1]["error"], -(x[1]["duration_s"] or 0)))
+    lines = [f"call {n}: {c['model'] or 'no model'} served by {c['served']} from host {c['host'] or '-'}, took"
+             f" {_dur(c['duration_s']) if c['duration_s'] is not None else '-'}"
+             + (f" (usually {_dur(c['usual_s'])})" if c.get("usual_s") else "")
+             + f", {c['input_tokens'] or 0} tokens in, {c['output_tokens'] or 0} out"
+             + (f", attempt {c['attempt']} of {c['attempts']}" if c["attempts"] > 1 else "")
+             + (f", error: {c['error']}" if c["error"] else "")
+             + "".join(f" {x}" for x in c.get("context") or [])
+             for n, c in named[:EXPLAIN_CALLS]]
+    prompt = "\n".join([f"session: {session_id}, {t['platform'] or 'unknown'} / {t['profile'] or 'no profile'},"
+                        f" {len(calls)} calls{', subagent' if t['parent'] else ''}",
+                        "analysis:", *(f"- {w}" for w in t["why"]),
+                        f"calls (failed and slowest first, {min(len(calls), EXPLAIN_CALLS)} of {len(calls)}):", *lines])
+    from agent.auxiliary_client import call_llm
+    from agent.portal_tags import get_affinity_scope, reset_affinity_scope, set_affinity_scope
+    route: Dict[str, str] = {}
+    token = None if get_affinity_scope() else set_affinity_scope("operations:explain")
+    try:
+        resp = call_llm(task="operations_summary", temperature=0.2, max_tokens=400, timeout=90,
+                        messages=[{"role": "system", "content": _EXPLAIN_PROMPT}, {"role": "user", "content": prompt}],
+                        route_info=route)
+        text = (resp.choices[0].message.content or "").strip()
+    except Exception as exc:  # the model or its provider: the page shows why
+        return {"text": None, "errors": {"model": f"{type(exc).__name__}: {exc}"[:300]}}
+    finally:
+        if token is not None:
+            reset_affinity_scope(token)
+    return {"text": text or None, "model": getattr(resp, "model", None) or route.get("model") or "unknown model",
+            "provider": route.get("provider"), "errors": {} if text else {"model": "the model answered with nothing"}}
+
+
 def find_session(m: sqlite3.Connection, prefix: str, before: float) -> Optional[Dict[str, Any]]:
     """The session a health finding names by the start of its id (findings cut ids short, and a cron job's runs
     share a start): of those begun by the finding, the one active last. A range on the id keeps to its index."""
     r = m.execute("SELECT session_id, MIN(ts) AS start, MAX(ts) AS end FROM records WHERE kind IN ('api', 'error')"
                   " AND session_id >= ? AND session_id < ? GROUP BY session_id HAVING start <= ? ORDER BY end DESC LIMIT 1",
                   (prefix, prefix + "\uffff", before)).fetchone()
-    return dict(r) if r else None
+    if not r:
+        return None
+    # where it ran, from its last call that says (an error row may not): the map selects that profile
+    last = m.execute(f"SELECT {_cols(m, 'host', 'profile')} FROM records WHERE kind IN ('api', 'error') AND session_id=?"
+                     " ORDER BY host IS NULL, ts DESC LIMIT 1", (r["session_id"],)).fetchone()
+    return {**dict(r), **(dict(last) if last else {})}
 
 
 @router.get("/find-session")
@@ -1085,23 +1312,36 @@ def topology_timeline(m: sqlite3.Connection, since: float, now: float) -> Dict[s
             "changes": changes[:TIMELINE_CHANGES], "more_changes": max(0, len(changes) - TIMELINE_CHANGES)}
 
 
-def router_roles() -> Dict[str, Any]:
-    """The model router's role aliases: each role's candidates in order, which are live, and the one it
-    resolves to now. Found the way the router's own plugin finds it: MODEL_ROUTER_URL (the router's
-    default address otherwise), and MODEL_ROUTER_TOKEN / ROUTER_TOKEN or <hermes root>/model-router/router.token.
-    An install without the router gets the error and the page keeps to observed traffic.
-    """
-    url = os.environ.get("MODEL_ROUTER_URL", "http://127.0.0.1:8867").rstrip("/")
+def _router_url() -> str:
+    return os.environ.get("MODEL_ROUTER_URL", "http://127.0.0.1:8867").rstrip("/")
+
+
+def _router(path: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """One call to the model router, found the way the router's own plugin finds it: MODEL_ROUTER_URL
+    (the router's default address otherwise), and MODEL_ROUTER_TOKEN / ROUTER_TOKEN or
+    <hermes root>/model-router/router.token. Raises what urlopen raises when it does not answer."""
     tok = os.environ.get("MODEL_ROUTER_TOKEN") or os.environ.get("ROUTER_TOKEN") or ""
     if not tok:
         try:
             tok = (get_default_hermes_root() / "model-router" / "router.token").read_text(encoding="utf-8").strip()
         except OSError:
             pass
-    req = urllib.request.Request(f"{url}/router/status", headers={"Authorization": f"Bearer {tok}"} if tok else {})
+    headers = {"Authorization": f"Bearer {tok}"} if tok else {}
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(f"{_router_url()}{path}", headers=headers,
+                                 data=None if payload is None else json.dumps(payload).encode())
+    with urllib.request.urlopen(req, timeout=3) as resp:
+        return json.loads(resp.read())
+
+
+def router_roles() -> Dict[str, Any]:
+    """The model router's role aliases: each role's candidates in order, which are live, and the one it
+    resolves to now. An install without the router gets the error and the page keeps to observed traffic.
+    """
+    url = _router_url()
     try:
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            snap = json.loads(resp.read())
+        snap = _router("/router/status")
     except (urllib.error.URLError, OSError, ValueError) as exc:
         return {"url": url, "error": str(exc), "roles": []}
     return {"url": url, "roles": [
@@ -2040,6 +2280,107 @@ def fix_alert(key: str = Body(..., embed=True), title: str = Body(..., embed=Tru
         out = {"ok": True, "card": card, "existing": False, "status": kanban_db.get_task(k, card).status,
                "started": False, "warning": ""}
     return _start_now(out, card, profile)
+
+
+_LMSTUDIO_URL = os.environ.get("LMSTUDIO_URL", "http://127.0.0.1:1234").rstrip("/")
+_ROUTER_CONFIG = get_default_hermes_root() / "model-router" / "router-config.json"
+
+
+@router.get("/models/role")
+def model_role(name: str = Query(..., min_length=1)) -> Dict[str, Any]:
+    """Three ways to bring back a router role with no loaded model, each with why it is off when it is:
+    load a candidate in LM Studio, point the role at a model already loaded with the context it needs,
+    or hand it to an agent whose profile has the router's role tools with writes on (rolectl-mcp with
+    ROLECTL_MCP_ALLOW_WRITE=1, its moderation gate)."""
+    try:
+        snap = _router("/router/status")
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise HTTPException(502, f"the model router at {_router_url()} is not answering: {exc}")
+    role = (snap.get("roles") or {}).get(name)
+    if role is None:
+        raise HTTPException(404, f"the model router has no role {name!r}")
+    need = role.get("min_context") or 0
+    cands = [{"model": c["id"], "live": bool(c.get("live")), "fit": c.get("fit") is not False}
+             for c in role.get("candidates_detail") or []]
+    try:
+        with urllib.request.urlopen(f"{_LMSTUDIO_URL}/api/v1/models", timeout=3) as resp:
+            # LM Link lists one entry per device; a model loaded on any of them is not loaded again
+            listed = json.loads(resp.read()).get("models") or []
+        idle = {m["key"] for m in listed if m.get("type") == "llm"} - {m["key"] for m in listed if m.get("loaded_instances")}
+        load = [c["model"] for c in cands if c["model"] in idle]
+        lmstudio = {"on": bool(load), "models": load,
+                    "note": "" if load else "No candidate of this role is in LM Studio waiting to be loaded."}
+    except (urllib.error.URLError, OSError, ValueError, KeyError, AttributeError) as exc:
+        lmstudio = {"on": False, "models": [], "note": f"LM Studio's server is not answering at {_LMSTUDIO_URL} ({exc}). "
+                                                      "Start it in LM Studio or with: lms server start"}
+    loaded = sorted(m for m, ctx in (snap.get("loaded") or {}).items()
+                    if (ctx or 0) >= need and not any(c["model"] == m and c["live"] for c in cands))
+    agents = []
+    for p in kanban_db.list_profiles_on_disk():
+        try:
+            servers = (safe_load(_profile_config(p).read_text(encoding="utf-8")) or {}).get("mcp_servers") or {}
+        except (OSError, YAMLError, AttributeError):
+            continue
+        if any(isinstance(v, dict) and "rolectl-mcp" in " ".join(map(str, [v.get("command", ""), *(v.get("args") or [])]))
+               and str((v.get("env") or {}).get("ROLECTL_MCP_ALLOW_WRITE")) == "1" for v in servers.values()):
+            agents.append(p)
+    return {"role": name, "min_context": need, "candidates": cands, "lmstudio": lmstudio,
+            "repoint": {"on": bool(loaded), "models": loaded,
+                        "note": "" if loaded else f"No loaded model has the {need} tokens of context this role needs."},
+            "agent": {"on": bool(agents), "profiles": agents,
+                      "note": "" if agents else "No profile can change router roles. Turn it on by adding rolectl-mcp under "
+                                                "mcp_servers in a profile's config.yaml with env ROLECTL_MCP_ALLOW_WRITE: \"1\"."}}
+
+
+@router.post("/models/load")
+def load_model(role: str = Body(..., embed=True), model: str = Body(..., embed=True)) -> Dict[str, Any]:
+    """Load one of the role's candidates in LM Studio, with the context the role needs so the router
+    takes it (LM Studio's default context is smaller, and the router skips a model loaded with too little)."""
+    st = model_role(role)
+    if model not in st["lmstudio"]["models"]:
+        raise HTTPException(400, f"{model} is not a candidate of {role} that LM Studio can load")
+    payload = {"model": model, "echo_load_config": True, **({"context_length": st["min_context"]} if st["min_context"] else {})}
+    req = urllib.request.Request(f"{_LMSTUDIO_URL}/api/v1/models/load", data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        # a large model takes minutes to load
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            out = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        raise HTTPException(502, f"LM Studio refused to load {model}: {exc.read().decode(errors='replace')[:500]}")
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise HTTPException(502, f"LM Studio did not finish loading {model}: {exc}")
+    return {"ok": True, "model": model, "context_length": (out.get("load_config") or {}).get("context_length")}
+
+
+@router.post("/models/repoint")
+def repoint_role(role: str = Body(..., embed=True), model: str = Body(..., embed=True)) -> Dict[str, Any]:
+    """Put a loaded model first among the role's candidates in the router's config, and reload the
+    router. The old config is kept beside it, as rolectl keeps it."""
+    if model not in model_role(role)["repoint"]["models"]:
+        raise HTTPException(400, f"{model} is not loaded with the context {role} needs")
+    try:
+        cfg = json.loads(_ROUTER_CONFIG.read_text(encoding="utf-8"))
+        cands = cfg["roles"][role]["candidates"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise HTTPException(409, f"{_ROUTER_CONFIG} has no role {role} to change: {exc}")
+    cfg["roles"][role]["candidates"] = ([c for c in cands if c.get("model") == model] or [{"model": model}]) \
+        + [c for c in cands if c.get("model") != model]
+    backup = _ROUTER_CONFIG.with_name(f"{_ROUTER_CONFIG.name}.bak.{time.strftime('%Y%m%d-%H%M%S')}")
+    backup.write_bytes(_ROUTER_CONFIG.read_bytes())
+    tmp = _ROUTER_CONFIG.with_name(f".{_ROUTER_CONFIG.name}.tmp")
+    tmp.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, _ROUTER_CONFIG)
+    try:
+        out = _router("/router/reload", {})
+    except urllib.error.HTTPError as exc:
+        out = {"error": exc.read().decode(errors="replace")[:500]}
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        out = {"error": str(exc)}
+    if not out.get("ok"):
+        raise HTTPException(502, f"the config now puts {model} first for {role} (old one: {backup.name}), "
+                                 f"but the router did not reload it: {out.get('error')}")
+    return {"ok": True, "role": role, "model": model, "backup": str(backup)}
 
 
 _RULE_ID = re.compile(r"[a-z0-9][a-z0-9-]*")

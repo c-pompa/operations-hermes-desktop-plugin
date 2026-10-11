@@ -74,7 +74,9 @@ class FlowTest(unittest.TestCase):
         n = {x["id"]: x for x in out["nodes"]}
         self.assertEqual(out["total"], 5)
         self.assertEqual((n["entry:cron"]["requests"], n["entry:cron"]["errors"]), (3, 2))
-        self.assertEqual((n["served:custom"]["requests"], n["served:custom"]["errors"]), (1, 1))
+        # nothing answered the failed call; it went out to "custom" but no device served it
+        self.assertEqual((n["served:no answer (custom)"]["requests"], n["served:no answer (custom)"]["errors"]), (1, 1))
+        self.assertEqual((n["served:no answer (custom)"]["no_answer"], n["served:host-a"]["no_answer"]), (True, False))
         self.assertNotIn("entry:unknown", n)
 
     def test_errors_grouped_by_what_failed_and_where(self):
@@ -93,9 +95,11 @@ class FlowTest(unittest.TestCase):
         m.close()
         out = api.errors_route(1, start=NOW - 3600)
         self.assertEqual([(g["count"], g["platform"], g["served"], g["error"], g["sessions"]) for g in out["groups"]],
-                         [(3, "subagent", "custom", "bad model", ["s2", "s1"]), (1, None, None, "http_400", [])])
+                         [(3, "subagent", "no answer (custom)", "bad model", ["s2", "s1"]), (1, None, None, "http_400", [])])
         g = out["groups"][0]
         self.assertEqual((g["first"], g["last"], g["host"], g["profile"], g["model"]), (NOW - 40, NOW - 20, "mbp", "default", "glm"))
+        self.assertEqual((g["no_answer"], g["timeouts"], g["busy"], g["answered_by"]), (True, 0, 0, None))
+        self.assertNotIn("busy", out["groups"][1])
 
     def test_hourly_by_served(self):
         hourly = api.flow(24)["hourly"]

@@ -23,7 +23,7 @@ A plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent) by [No
   worker, mark it done or close it.
 - **Trace**: opens a session as a timeline of its model calls and the subagents it started. "Why
   it took this long" names the longest wait and the calls that ran well past their usual time,
-  measured against similar calls from the week before.
+  measured against similar calls from the week before, and says what each failed call ran into.
 - **Merge requests**: open and recently merged MRs, who each one is waiting on and for how long,
   and where its pipeline stands.
 - **Conformance**: checks your projects for leaked keys and tokens, merge conflict markers and
@@ -67,7 +67,18 @@ Or in Hermes Desktop: Capabilities > Plugins > Install from Git, with the same U
 - **Vitals** for the chosen window, plus hosts with the model pool and recent activity.
 - **Today strip**: an hour's requests, errors and tasks, incidents and changes. Hover a mark to
   see what it is; click it for a side drawer with links to the map at that time, Flow, Trace,
-  Handoffs or the merge request.
+  Handoffs or the merge request. An hour's drawer follows its lane: requests show where they came
+  from, the models asked for and what served them, with a line on how many failed; errors show
+  the failed calls; tasks link to Handoffs. A health finding about a session links to the session
+  in Trace and to its profile on the map over the session (its last hour if it ran longer).
+  Incidents and each group of failed calls have **Fix this**, as on a Needs attention card: a new
+  chat or a kanban card for a profile, with what failed, where, its sessions and how to check.
+  An incident about a model router role with no loaded model also offers three ways to bring it
+  back: load a candidate in LM Studio (with the context the role needs), put a model that is
+  already loaded first for the role (the router config is backed up and the router reloaded), or
+  file a card for a Hermes agent. Each is greyed with a note when it cannot work: LM Studio's
+  server not answering or no candidate to load, no loaded model with enough context, or no profile
+  with `rolectl-mcp` under `mcp_servers` and `ROLECTL_MCP_ALLOW_WRITE: "1"`.
 - **Errors in an hour** are grouped by what failed and where (error text, entry point and host,
   profile, model, what served it), each linking to its newest failing session in Trace, its
   model in Flow and the map over that hour.
@@ -137,7 +148,9 @@ with.
 ### Flow
 
 - Charts the window's requests from entry point to profile to model to what served them (a pool
-  device, or the cloud provider when no device did), with requests per hour below.
+  device, else the provider it was sent to), with requests per hour below. A failed call that
+  nothing answered goes to "no answer (provider)" rather than counting against a provider:
+  behind a router the provider is only a name like "custom".
 - Each device or provider keeps the color it first got on this Desktop; red is reserved for
   failures. A client's failed calls count as requests and show as a red share of each bar (the
   router's own errors have no entry point and stay in the Errors card).
@@ -145,7 +158,13 @@ with.
   other bars count what passed through it, and the hourly chart scales to it with the failed
   share in red.
 - **What failed**: when part of a selection failed, the side panel lists each error, where and
-  when, with links to the session in Trace and to the map.
+  when, with links to the session in Trace and to the map. Under each, a cause line says how many
+  timed out at Hermes' 30 minute limit for a model call (`HERMES_API_TIMEOUT`), how many other
+  sessions had calls to that model in flight meanwhile, and what served those that got an answer.
+- **Fit to screen** (in the Request flow header) gives the chart the page's full width on a wider
+  canvas, so its labels read larger without the bands swelling, and moves the side panel below
+  it: what failed on the left, where the requests went on the right. "Side by side" puts it
+  back; this Desktop remembers which.
 - A link to something with no requests in the window says so and offers the last 7 days.
 
 ### Activity
@@ -177,8 +196,19 @@ with.
 - Lists the window's sessions that made model calls. One opens as a timeline of its calls: turn,
   model, what served it, time to first token, tokens and any failure, plus the subagents it
   started (and for a subagent, its parent).
-- **Why it took this long** splits the session into model calls and the waits between them,
-  names the longest wait, and lists calls that took at least twice as long as usual.
+- **Why it took this long** splits the session into model calls and the waits between them
+  (calls that overlap count once), names the longest wait, and lists calls that took at least
+  twice as long as usual.
+- **Retries**: Hermes retries a failed call under the same request id, timing each attempt from
+  the first. Trace shows each as "attempt k of n", drawn from where the attempt before it ended,
+  and says whether a later attempt got the answer.
+- **Failed calls**: the call's side panel says what happened: whether it timed out, which attempt
+  it was, how many other sessions were waiting on the same model, and what served those that were
+  answered and in how long. "See its traffic" opens Flow on that model from an hour before the
+  call to an hour after it.
+- **Explain this session** asks the model set for the "operations_summary" auxiliary task to read
+  the trace (the analysis and up to 60 calls, failed and slowest first) and say what happened in a
+  few sentences. It runs once per click and stores nothing; check it against the calls.
 - "Usual" is the median of similar calls in the week before: same model on the same server, half
   to twice the output tokens, from other sessions. With fewer than five, it says so.
 
@@ -256,6 +286,8 @@ user mode.
   (a gateway that dropped, a health finding, a host that went quiet): a toast with a link, and a
   system notification while you are away (Settings > Notifications > "Plugin notifications").
 - More than three at once arrive as one summary. Kanban cards are left to the Kanban plugin.
+- A health finding that suggests checking a session for a retry loop is corrected when that
+  session's calls timed out instead: the model was slow or queued, which Trace shows.
 - What has been alerted is remembered across restarts. The first run only records what is
   already listed; an item that clears alerts again if it returns.
 - The Notifications tab keeps the newest 200 alerts with an unread count, since Desktop has no
@@ -279,6 +311,8 @@ checklist on the Notifications tab, and an "N setup steps left" link on Overview
 Settings steps open the plugin settings. Desktop builds that form only for a profile with its own
 copy of the plugin, so for a profile using `~/.hermes/plugins` the step shows the
 `hermes -p <profile> config set ...` command with a Copy command button.
+
+Collapse folds the checklist to one line naming the steps still to do; this Desktop remembers it.
 
 ### Roles
 

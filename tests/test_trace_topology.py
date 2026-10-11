@@ -7,7 +7,10 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
+
+from fastapi import HTTPException
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location(
@@ -119,12 +122,18 @@ class TraceTopologyTest(unittest.TestCase):
     def test_a_findings_cut_short_session_is_the_one_begun_by_then_active_last(self):
         m = sqlite3.connect(self.db)
         for day in (1, 2):
-            rec(m, ts=NOW - 86400 * (3 - day), kind="api", session_id=f"cron_ab_2026100{day}_0800")
+            rec(m, ts=NOW - 86400 * (3 - day), kind="api", session_id=f"cron_ab_2026100{day}_0800", host="mbp", profile=f"p{day}")
+        # a later error row that names no host
+        rec(m, ts=NOW - 60, kind="error", session_id="cron_ab_20261002_0800")
         m.commit()
         m.close()
         m = api._ro(self.db)
         try:
-            self.assertEqual(api.find_session(m, "cron_ab_202610", NOW)["session_id"], "cron_ab_20261002_0800")
+            found = api.find_session(m, "cron_ab_202610", NOW)
+            self.assertEqual(found["session_id"], "cron_ab_20261002_0800")
+            # where it ran, for the map, from its last call that says
+            self.assertEqual((found["host"], found["profile"]), ("mbp", "p2"))
+            self.assertEqual(api.find_session(m, "cron_ab_202610", NOW)["host"], "mbp")
             self.assertEqual(api.find_session(m, "cron_ab_202610", NOW - 86400 * 1.5)["session_id"], "cron_ab_20261001_0800")
             self.assertIsNone(api.find_session(m, "cron_ab_202610", NOW - 86400 * 3))
             # the whole id is its own prefix
@@ -142,12 +151,107 @@ class TraceTopologyTest(unittest.TestCase):
         self.assertEqual(out["errors"], {})
         calls = out["calls"]
         self.assertEqual([c["turn"] for c in calls], [1, 2, 2])
-        self.assertEqual([c["served"] for c in calls], ["nous", "host-a", "unknown"])
+        self.assertEqual([c["served"] for c in calls], ["nous", "host-a", "no answer"])
+        self.assertEqual([c["no_answer"] for c in calls], [False, False, True])
         self.assertEqual([c["pool_device"] for c in calls], [False, True, False])
         self.assertEqual(calls[0]["ttft_s"], 0.5)
         self.assertEqual(calls[2]["error"], "403 spending limit")
         self.assertEqual([(a["session_id"], a["calls"], a["label"]) for a in out["subagents"]], [("c", 1, "explore")])
         self.assertEqual(api.trace_session("c")["parent"], "p")
+
+    def retried_session(self):
+        """Session "r" asks "big" once and gets no answer twice before a third attempt does (Hermes times each
+        attempt from the first). Two other sessions use "big" meanwhile; "o2" also had to retry."""
+        t0 = NOW - 5000  # when the first attempt gave up
+        m = sqlite3.connect(self.db)
+        m.execute("ALTER TABLE records ADD COLUMN api_request_id TEXT")
+        for ts, dur, kind, dev in ((t0, 1800, "error", None), (t0 + 1800, 3600, "error", None), (t0 + 2000, 3800, "api", "host-a")):
+            rec(m, ts=ts, duration_s=dur, kind=kind, device=dev, session_id="r", turn_id="r:t1", platform="cli", model="big",
+                provider="custom", api_request_id="q1", output_tokens=10 if dev else None)
+        rec(m, ts=t0 - 500, duration_s=600, kind="api", session_id="o", model="big", device="host-a", api_request_id="q2")
+        rec(m, ts=t0 - 200, duration_s=1800, kind="error", session_id="o2", model="big", api_request_id="z")
+        rec(m, ts=t0 + 100, duration_s=2100, kind="api", session_id="o2", model="big", device="host-a", api_request_id="z")
+        m.commit()
+        m.close()
+        return t0
+
+    def test_retries_are_attempts_of_one_request(self):
+        t0 = self.retried_session()
+        calls = api.trace_session("r")["calls"]
+        self.assertEqual([(c["attempt"], c["attempts"]) for c in calls], [(1, 3), (2, 3), (3, 3)])
+        # each attempt is redrawn from where the one before it ended
+        self.assertEqual([(c["start"], c["duration_s"]) for c in calls], [(t0 - 1800, 1800), (t0, 1800), (t0 + 1800, 200)])
+        self.assertEqual([c["served"] for c in calls], ["no answer (custom)", "no answer (custom)", "host-a"])
+        self.assertEqual([c["via"] for c in calls], ["custom"] * 3)
+
+    def test_a_failed_call_says_it_timed_out_and_how_busy_its_model_was(self):
+        self.retried_session()
+        out = api.trace_session("r")
+        first = out["calls"][0]
+        self.assertTrue(first["timed_out"])
+        # o and o2 overlapped it; o2's answer took 300s of its own after its failed 1800s attempt
+        self.assertEqual((first["busy"], first["answered_by"], first["answered_s"]), (2, "host-a", 450))
+        self.assertEqual(first["context"], [
+            "Timed out: no answer within 30m, Hermes' limit for a model call (HERMES_API_TIMEOUT). The model was slow"
+            " or queued rather than broken.",
+            "Attempt 1 of 3; call 1.3 got the answer.",
+            "2 other sessions had big calls in flight while it waited.",
+            "Those that got an answer were served by host-a and took a median 7m."])
+        self.assertIn("Call 1.1 and call 1.2 got no answer and were retried; a later attempt got it.", out["why"])
+        self.assertIn("All 2 failed attempts timed out with no answer after 30m, Hermes' limit for a model call: the model"
+                      " was slow or queued, not broken.", out["why"])
+        self.assertFalse(any("failed on every attempt" in w for w in out["why"]))
+
+    def test_busy_time_counts_overlapping_calls_once(self):
+        m = sqlite3.connect(self.db)
+        rec(m, ts=NOW - 100, duration_s=100, kind="api", session_id="x", turn_id="x:t1", model="glm", provider="nous")
+        rec(m, ts=NOW - 50, duration_s=100, kind="api", session_id="x", turn_id="x:t2", model="glm", provider="nous")
+        m.commit()
+        m.close()
+        self.assertIn("took 2m of the session's 2m (100%)", api.trace_session("x")["why"][0])
+
+    def test_timed_out_is_a_failure_on_a_multiple_of_the_api_timeout(self):
+        self.assertEqual([api._timed_out(d) for d in (1800, 1795, 1829, 3600, 1700, 900, 2700, None)],
+                         [True, True, True, True, False, False, False, False])
+
+    def test_a_retry_loop_hint_is_corrected_for_a_session_whose_calls_timed_out(self):
+        m = sqlite3.connect(self.db)
+        rec(m, ts=NOW - 100, duration_s=1800, kind="error", session_id="20261006_101700_96faea12", model="big")
+        rec(m, ts=NOW - 100, duration_s=12, kind="error", session_id="20261006_111111_aaaaaaaa", model="big")
+        m.commit()
+        m.close()
+        m = api._ro(self.db)
+        try:
+            fix = api._session_action(m, "session 20261006_101700_96fa… at 86k tok", "check for a retry loop", NOW)
+            self.assertTrue(fix.startswith("Not a retry loop: 1 call to big got no answer within 30m and timed out"), fix)
+            # another hint, or a session whose failures were not timeouts, stays as the finding said
+            self.assertEqual(api._session_action(m, "session 20261006_101700_96fa… at 86k tok", "compress it", NOW),
+                             "compress it")
+            self.assertEqual(api._session_action(m, "session 20261006_111111_aaaa… at 86k tok", "check for a retry loop",
+                                                 NOW), "check for a retry loop")
+        finally:
+            m.close()
+
+    def test_explain_sends_the_trace_failed_calls_first(self):
+        self.retried_session()
+        sent = []
+
+        def call(**kw):
+            sent.append(kw)
+            kw["route_info"].update(provider="lmstudio", model="qwen3-4b")
+            return SimpleNamespace(model="qwen3-4b", choices=[SimpleNamespace(message=SimpleNamespace(content=" It queued. "))])
+        with mock.patch("agent.auxiliary_client.call_llm", call):
+            out = api.trace_explain("r")
+        self.assertEqual(out, {"text": "It queued.", "model": "qwen3-4b", "provider": "lmstudio", "errors": {}})
+        self.assertEqual(sent[0]["task"], "operations_summary")
+        prompt = sent[0]["messages"][1]["content"]
+        self.assertLess(prompt.index("call 1.1:"), prompt.index("call 1.3:"))
+        self.assertIn("attempt 1 of 3", prompt)
+        self.assertIn("Timed out: no answer within 30m", prompt)
+        with mock.patch("agent.auxiliary_client.call_llm", side_effect=RuntimeError("no provider")):
+            self.assertEqual(api.trace_explain("r"), {"text": None, "errors": {"model": "RuntimeError: no provider"}})
+        with self.assertRaises(HTTPException):
+            api.trace_explain("nothing")
 
     def test_topology_links_gateways_hosts_and_what_served_them(self):
         out = api.topology_route(24)

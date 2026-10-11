@@ -25,7 +25,8 @@
  * at /api/plugins/operations/ and reached only through ctx.rest. Read-only except the
  * Handoffs card actions (hand an open card to a profile, or close it), the Conformance
  * actions (file a card to fix a host's drift or record fixing it by hand, propose a rule as a
- * merge request), saved roles, and Activity summaries when the install turns them on.
+ * merge request), saved roles, and Activity summaries when the install turns them on. Explaining a
+ * session in Trace calls the summaries model once per click and writes nothing.
  *
  * Routes:
  *   GET /overview?hours=N -> { vitals, today, attention, hosts, activity, errors }
@@ -38,10 +39,14 @@
  *   GET /trace?hours=N    -> { sessions, truncated, errors }
  *   GET /find-session?prefix=&before= -> { session: {session_id, start, end} | null, errors } (a health finding's cut-short id)
  *   GET /trace/{session}  -> { calls, subagents, parent, why, platform, profile, truncated, errors }
+ *   POST /trace/{session}/explain -> { text, model, provider, errors } (written on request by the summaries model)
  *   GET /topology?hours=N -> { hosts (with drift), gateways, edges (with models), served, timeline (replay), router, errors }
  *   GET /attention        -> { items: the attention list alone, errors } (the alert poll)
  *   GET /assignees        -> { assignees: profile names }
  *   POST /attention/fix {key, title, body, profile} -> a kanban card for one alert, started now: { ok, card, existing, status, started, warning }
+ *   GET /models/role?name= -> { role, min_context, candidates, lmstudio, repoint, agent } (each way: { on, models | profiles, note })
+ *   POST /models/load {role, model}    -> loads a candidate in LM Studio with the role's context: { ok, model, context_length }
+ *   POST /models/repoint {role, model} -> puts a loaded model first for the role and reloads the router: { ok, backup }
  *   POST /cards/{id}/assign {profile, start_at?} -> { ok, status, started, warning, starts_at? }
  *   POST /cards/{id}/unblock {comment}       -> { ok, status, started, warning }
  *   POST /cards/{id}/close {outcome, result} -> { ok, status }
@@ -213,7 +218,7 @@ const muted = text => jsx('div', { className: 'text-xs text-(--ui-text-quaternar
 
 // --- layout pieces --------------------------------------------------------------------
 
-function Section({ title, count, error, children }) {
+function Section({ title, count, action, error, children }) {
   return jsxs('div', {
     className: 'overflow-hidden rounded-md border border-(--ui-stroke-secondary)',
     children: [
@@ -222,8 +227,14 @@ function Section({ title, count, error, children }) {
         style: { backgroundColor: 'color-mix(in srgb, var(--ui-stroke-secondary) 40%, transparent)' },
         children: [
           jsx('span', { className: 'text-xs font-medium', children: title }),
-          count != null
-            ? jsx('span', { className: 'text-[0.6875rem] text-(--ui-text-quaternary)', children: String(count) })
+          count != null || action
+            ? jsxs('span', {
+                className: 'flex items-center gap-3',
+                children: [
+                  count != null ? jsx('span', { className: 'text-[0.6875rem] text-(--ui-text-quaternary)', children: String(count) }) : null,
+                  action
+                ]
+              })
             : null
         ]
       }),
@@ -395,7 +406,7 @@ function Drawer({ label, head, onClose, children }) {
         style: {
           position: 'fixed', ...at, zIndex: 61, width: box ? `min(27rem, ${Math.round(box.width * 0.92)}px)` : '27rem', overflowY: 'auto',
           display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', gap: 16, alignContent: 'start', padding: '16px 18px 24px',
-          backgroundColor: 'color-mix(in srgb, var(--ui-surface-background, var(--ui-bg-elevated, #0d1117)) 86%, transparent)',
+          backgroundColor: 'color-mix(in srgb, var(--ui-surface-background, var(--ui-bg-elevated, #0d1117)) 80%, transparent)',
           backdropFilter: 'blur(14px)', WebkitBackdropFilter: 'blur(14px)',
           borderLeft: '1px solid var(--ui-stroke-secondary)', boxShadow: '-24px 0 48px -24px rgb(0 0 0 / 0.55)'
         },
@@ -510,22 +521,37 @@ function TodayStrip({ hours, changes = [], incidents = [] }) {
   const slot = h => ({ position: 'absolute', left: at(h.ts), width: `calc(${100 / 24}% - 2px)` })
   const today = changes.filter(c => c.ts >= day0)
   const what = c => `${c.kind === 'merged' ? 'Merged' : 'Model'}: ${c.text}`
-  const hourOf = h => ({
-    head: `${fmtClock(h.ts)} to ${fmtClock(h.ts + 3600)}`, tone: h.errors ? TONE.bad : TONE.info,
-    title: `${plural(h.requests, 'request')}, ${plural(h.errors, 'error')}`,
-    lines: h.tasks_done || h.tasks_failed ? [`${h.tasks_done} tasks done, ${h.tasks_failed} failed`] : [],
+  // an hour opens on the lane clicked: its requests, its errors or its tasks
+  const hourOf = (h, lane) => ({
+    head: `${fmtClock(h.ts)} to ${fmtClock(h.ts + 3600)}`,
+    tone: lane === 'requests' ? TONE.info : lane === 'errors' || h.tasks_failed ? TONE.bad : TONE.good,
+    title: lane === 'requests' ? `${plural(h.requests, 'request')}${h.errors ? `, ${h.errors} failed` : ''}`
+      : lane === 'errors' ? `${plural(h.errors, 'error')} in ${plural(h.requests, 'request')}`
+      : `${plural(h.tasks_done, 'task')} done, ${h.tasks_failed} failed`,
+    lines: [],
     changes: today.filter(c => c.ts >= h.ts && c.ts < h.ts + 3600),
-    errorsFrom: h.errors ? h.ts : null,
+    requestsFrom: lane === 'requests' ? h.ts : null,
+    errorsFrom: lane === 'errors' ? h.ts : null,
+    failed: lane === 'requests' ? h.errors : 0,
+    errorsOf: () => hourOf(h, 'errors'),
     // the map, Flow, Trace and Handoffs over just this hour; the map as the hour ended (or now)
-    go: [['See the map at this hour', 'topology', null, { at: Math.min(h.ts + 3600, now), start: h.ts }], ['See the traffic in Flow', 'flow', null, { hours: 1, start: h.ts }],
-         ['See the sessions in Trace', 'trace', null, { hours: 1, start: h.ts }], ...(h.tasks_done || h.tasks_failed ? [['See the tasks in Handoffs', 'handoffs', null, { hours: 1, start: h.ts }]] : [])]
+    go: [['See the traffic in Flow', 'flow', null, { hours: 1, start: h.ts }], ['See the sessions in Trace', 'trace', null, { hours: 1, start: h.ts }],
+         ['See the map at this hour', 'topology', null, { at: Math.min(h.ts + 3600, now), start: h.ts }],
+         ...(lane === 'tasks' ? [['See the tasks in Handoffs', 'handoffs', null, { hours: 1, start: h.ts }]] : [])]
   })
   // a host or a gateway is selected on the map
   const nodeOf = it => (it.source === 'host' ? `h:${it.key.slice('host:'.length)}` : it.source === 'gateway' && it.host ? `g:${it.host}:${it.key.slice('gateway:'.length, it.key.lastIndexOf(':'))}` : null)
   const incidentOf = (it, node = nodeOf(it)) => ({
-    head: `since ${fmtClock(it.ts)}`, tone: it.sev === 'crit' ? TONE.bad : TONE.warn, title: it.text,
+    head: `since ${it.ts < day0 ? new Date(it.ts * 1000).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : fmtClock(it.ts)}`, tone: it.sev === 'crit' ? TONE.bad : TONE.warn, title: it.text,
     lines: [`ongoing for ${fmtDur(now - it.ts)}`, ...(it.action ? [`${it.source === 'gateway' ? 'Error' : 'What to do'}: ${it.action}`] : []), `from ${it.source}`],
-    go: [...(node ? [[`Show the ${it.source} on the map`, 'topology', node]] : []), ['See the map when it started', 'topology', node, { at: it.ts }]]
+    role: it.role,
+    // a finding about a session links to the session and its profile, not the whole map
+    finding: findingSession(it) ? it : null,
+    // a kanban item already has its card; the rest can be handed to a chat or a card
+    fix: it.source !== 'kanban' ? it : null,
+    // the map reaches back 7 days
+    go: [...(node ? [[`Show the ${it.source} on the map`, 'topology', node]] : []),
+         ...(!findingSession(it) && now - it.ts <= 168 * 3600 ? [['See the map when it started', 'topology', node, { at: it.ts }]] : [])]
   })
   const changeOf = c => ({
     head: fmtClock(c.ts), tone: c.kind === 'merged' ? TONE.info : TONE.purple, title: what(c),
@@ -559,15 +585,15 @@ function TodayStrip({ hours, changes = [], incidents = [] }) {
         style: { gridTemplateColumns: '4.5rem 1fr' },
         children: [
           // the whole hour is the target, so a short bar is as easy to hover as a tall one
-          ...lane('requests', '2.25rem', hours.map(h => mark(h.ts, hourOf(h), { ...slot(h), top: 0, bottom: 0 },
+          ...lane('requests', '2.25rem', hours.map(h => mark(h.ts, hourOf(h, 'requests'), { ...slot(h), top: 0, bottom: 0 },
             jsx('div', { style: { position: 'absolute', left: 0, right: 0, bottom: 0, height: `${Math.max(h.requests ? 6 : 0, (h.requests / maxReq) * 100)}%`, backgroundColor: TONE.info, opacity: 0.75, borderRadius: '2px 2px 0 0' } })))),
           ...lane('incidents', `${Math.max(1, incidents.length) * 0.5}rem`, incidents.map((it, i) => mark(it.key || i, incidentOf(it), {
             position: 'absolute', left: at(Math.max(it.ts, day0)), right: `calc(100% - ${at(now)})`, minWidth: 4, top: `${i * 0.5}rem`, height: '0.375rem', borderRadius: 1, backgroundColor: it.sev === 'crit' ? TONE.bad : TONE.warn
           }))),
-          ...lane('errors', '0.5rem', hours.filter(h => h.errors).map(h => mark(h.ts, hourOf(h), { ...slot(h), top: 0, bottom: 0, backgroundColor: TONE.bad, opacity: 0.35 + 0.65 * (h.errors / maxErr), borderRadius: 2 }))),
+          ...lane('errors', '0.5rem', hours.filter(h => h.errors).map(h => mark(h.ts, hourOf(h, 'errors'), { ...slot(h), top: 0, bottom: 0, backgroundColor: TONE.bad, opacity: 0.35 + 0.65 * (h.errors / maxErr), borderRadius: 2 }))),
           ...lane('tasks', '0.75rem', hours.filter(h => h.tasks_done || h.tasks_failed).map(h => {
             const m = small(h.ts + 1800, h.tasks_failed ? TONE.bad : TONE.good, true)
-            return mark(h.ts, hourOf(h), m.style, m.child)
+            return mark(h.ts, hourOf(h, 'tasks'), m.style, m.child)
           })),
           ...lane('changes', '0.75rem', today.map((c, i) => {
             const m = small(c.ts, c.kind === 'merged' ? TONE.info : TONE.purple)
@@ -602,12 +628,76 @@ function TodayStrip({ hours, changes = [], incidents = [] }) {
           jsx('div', { key: 'c', style: { color: DIM }, children: 'click for details' })
         ])
       }) : null,
-      open ? jsx(StripDrawer, { item: open, onClose: () => setOpen(null) }) : null
+      open ? jsx(StripDrawer, { item: open, onClose: () => setOpen(null), onOpen: setOpen }) : null
     ]
   })
 }
 
-function StripDrawer({ item, onClose }) {
+// A router role with no loaded model, three ways back: load a candidate in LM Studio, point the role at a
+// model already loaded, or hand it to an agent whose profile can change roles. A way that cannot work
+// now is greyed, with what turns it on.
+function ModelActions({ role }) {
+  const qc = useQueryClient()
+  const { data, error, isLoading } = useQuery({ queryKey: [ID, 'models-role', role], queryFn: () => api.rest(`/models/role?name=${encodeURIComponent(role)}`) })
+  const [pick, setPick] = useState({})
+  const [busy, setBusy] = useState(null)
+  const [note, setNote] = useState(null)
+  if (isLoading) return jsx(Skeleton, { className: 'h-24' })
+  if (error) return muted(error.message || String(error))
+  const run = async (way, choice) => {
+    setBusy(way)
+    setNote(null)
+    try {
+      if (way === 'load') {
+        const out = await api.rest('/models/load', { method: 'POST', body: { role, model: choice } })
+        setNote({ text: `Loaded ${choice} with ${out.context_length || data.min_context} tokens of context; the router takes it on its next check.` })
+      } else if (way === 'repoint') {
+        await api.rest('/models/repoint', { method: 'POST', body: { role, model: choice } })
+        setNote({ text: `${role} now tries ${choice} first. The old router config is kept beside it.` })
+      } else {
+        const out = await api.rest('/attention/fix', { method: 'POST', body: {
+          key: `model-role:${role}`, title: `Get a loaded model for router role ${role}`, profile: choice,
+          body: [`The model router role ${role} has no loaded model it can use, so whatever calls it fails.`,
+                 `Candidates, in order: ${data.candidates.map(c => c.model).join(', ') || 'none'}. It needs ${data.min_context} tokens of context.`, '',
+                 'Use the router role tools (rolectl) to load a candidate or point the role at a loaded model that fits, then check the role resolves. If a step needs a person, block this card and say what.'].join('\n') } })
+        setNote({ bad: !!out.warning, card: out.card, text: out.existing ? `Card ${out.card} for this role is already open (${out.status}).` : out.warning || `Card ${out.card} filed for ${choice} (${out.status}).` })
+      }
+      qc.invalidateQueries({ queryKey: [ID] })
+    } catch (e) {
+      setNote({ bad: true, text: e?.message || String(e) })
+    }
+    setBusy(null)
+  }
+  const ways = [
+    ['load', 'Load in LM Studio', data.lmstudio, data.lmstudio.models],
+    ['repoint', 'Use this loaded model', data.repoint, data.repoint.models],
+    ['agent', 'Ask a Hermes agent', data.agent, data.agent.profiles]
+  ]
+  return jsxs('div', {
+    className: 'grid gap-3',
+    children: [
+      ...ways.map(([way, label, state, options]) => {
+        const choice = pick[way] || options[0] || ''
+        return jsxs('div', { key: way, className: 'grid gap-1', children: [
+          jsxs('div', { className: 'flex flex-wrap items-center gap-2', children: [
+            jsxs(Select, { value: choice, onValueChange: v => setPick({ ...pick, [way]: v }), disabled: !state.on || !!busy, children: [
+              jsx(SelectTrigger, { className: 'h-7 w-56 text-xs', children: jsx(SelectValue, { placeholder: way === 'agent' ? 'No profile can' : 'No model' }) }),
+              jsx(SelectContent, { children: options.map(o => jsx(SelectItem, { key: o, value: o, children: o })) })
+            ] }),
+            jsx(Button, { size: 'xs', variant: 'ghost', disabled: !state.on || !choice || !!busy, onClick: () => run(way, choice),
+                          children: busy === way ? (way === 'load' ? 'Loading, this can take minutes' : 'Working') : label })
+          ] }),
+          state.on ? null : muted(state.note)
+        ] })
+      }),
+      note ? jsxs('div', { key: 'note', className: 'flex flex-wrap items-center gap-2', style: { fontSize: 13, color: note.bad ? TONE.bad : undefined }, children: [
+        note.text, note.card && !note.bad ? jsx(GoLink, { tab: 'handoffs', sel: note.card, children: 'Open the card in Handoffs' }) : null
+      ] }) : null
+    ]
+  })
+}
+
+function StripDrawer({ item, onClose, onOpen }) {
   return jsx(Drawer, {
     label: item.title,
     onClose,
@@ -617,23 +707,72 @@ function StripDrawer({ item, onClose }) {
     ],
     children: [
       drawerTitle(item.title),
+      item.requestsFrom != null ? jsx(HourRequests, { key: 'r', start: item.requestsFrom, failed: item.failed, onErrors: () => onOpen(item.errorsOf()) }) : null,
       item.errorsFrom != null ? jsx(HourErrors, { key: 'e', start: item.errorsFrom }) : null,
       item.lines.length ? drawerPart('d', 'Details', jsx('div', { className: 'grid gap-1', children: item.lines.map((l, i) => jsx('div', { key: i, style: { fontSize: 13.5, overflowWrap: 'anywhere' }, children: l })) })) : null,
-      item.changes?.length ? drawerPart('c', `Changes this hour (${item.changes.length})`, jsx('div', {
-        className: 'divide-y divide-(--ui-stroke-secondary)',
-        children: item.changes.map((c, i) => jsxs('div', { key: i, className: 'grid gap-0.5 py-1.5', children: [
-          jsxs('div', { className: 'flex items-center gap-2 text-[0.6875rem] text-(--ui-text-quaternary)', children: [
-            jsx(KindBox, { children: c.kind === 'merged' ? 'MR' : 'Model' }),
-            jsx('span', { className: 'tabular-nums', style: { fontFamily: MONO }, children: fmtClock(c.ts) }),
-            c.url ? jsx('a', { href: c.url, onClick: openOut, className: 'ml-auto text-(--ui-accent) hover:underline', children: 'Open merge request' }) : null
-          ] }),
-          jsx('div', { style: { fontSize: 13.5, overflowWrap: 'anywhere' }, children: c.text })
-        ] }))
-      })) : null,
+      item.role ? drawerPart('m', `Model for ${item.role}`, jsx(ModelActions, { role: item.role })) : null,
+      item.fix ? jsx(FixThis, { key: 'fix', a: item.fix, btn: true }) : null,
       jsxs('div', { key: 'go', className: 'flex flex-wrap gap-2', children: [
         item.url ? jsx('a', { key: 'url', href: item.url, onClick: openOut, className: 'hover:bg-(--chrome-action-hover)', style: BTN, children: 'Open merge request' }) : null,
+        item.finding ? jsx(SessionLink, { key: 'sess', it: item.finding, btn: true }) : null,
         ...item.go.map(([label, tab, sel, when]) => jsx(GoLink, { key: label, btn: true, tab, sel, ...when, children: label }))
-      ] })
+      ] }),
+      item.changes?.length ? jsx(HourChanges, { key: 'c', changes: item.changes }) : null
+    ]
+  })
+}
+
+// An hour's merges and model loads: extra to what was clicked, so after its actions, behind a divider and
+// collapsible; this Desktop remembers whether it is open.
+const CHANGES_OPEN = 'strip.changes.open'
+function HourChanges({ changes }) {
+  const [open, setOpen] = useState(() => storeGet(CHANGES_OPEN, false))
+  const toggle = () => { haptic('tap'); try { api.storage.set(CHANGES_OPEN, !open) } catch {} setOpen(!open) }
+  return jsxs('div', { style: { borderTop: '1px solid var(--ui-stroke-secondary)', paddingTop: 12 }, children: [
+    jsxs('button', { key: 'h', type: 'button', onClick: toggle, 'aria-expanded': open, className: 'flex items-center gap-1.5', style: { ...LABEL, marginBottom: open ? 6 : 0 }, children: [
+      // a CSS triangle: down while open, right while collapsed
+      jsx('span', { key: 'v', 'aria-hidden': true, style: open
+        ? { borderLeft: '4px solid transparent', borderRight: '4px solid transparent', borderTop: '5px solid currentColor' }
+        : { borderTop: '4px solid transparent', borderBottom: '4px solid transparent', borderLeft: '5px solid currentColor' } }),
+      `Also this hour: ${plural(changes.length, 'change')}`
+    ] }),
+    open ? jsx('div', {
+      className: 'divide-y divide-(--ui-stroke-secondary)',
+      children: changes.map((c, i) => jsxs('div', { key: i, className: 'grid gap-0.5 py-1.5', children: [
+        jsxs('div', { className: 'flex items-center gap-2 text-[0.6875rem] text-(--ui-text-quaternary)', children: [
+          jsx(KindBox, { children: c.kind === 'merged' ? 'MR' : 'Model' }),
+          jsx('span', { className: 'tabular-nums', style: { fontFamily: MONO }, children: fmtClock(c.ts) }),
+          c.url ? jsx('a', { href: c.url, onClick: openOut, className: 'ml-auto text-(--ui-accent) hover:underline', children: 'Open merge request' }) : null
+        ] }),
+        jsx('div', { style: { fontSize: 13.5, overflowWrap: 'anywhere' }, children: c.text })
+      ] }))
+    }) : null
+  ] })
+}
+
+// The hour's requests: where they came from, the models they asked for and what served them, each
+// opening Flow on it over the hour. Its failures get a line pointing at the errors view.
+function HourRequests({ start, failed, onErrors }) {
+  const go = useContext(Nav)
+  const { data, isLoading, isError } = useFlow(1, start)
+  const err = data?.errors?.flow || data?.errors?.metrics
+  if (isError || err) return drawerText('r', `Could not load them: ${err || 'the backend did not respond'}.`)
+  if (isLoading || !data) return jsx(Skeleton, { className: 'h-24 w-full' })
+  const nodes = data.nodes || []
+  const colors = servedColors(nodes.filter(n => n.col === 'served').map(n => n.id))
+  const top = col => nodes.filter(n => n.col === col).sort((a, b) => b.requests - a.requests).slice(0, 5)
+    .map(n => ({ id: n.id, label: n.label, n: n.requests, color: colors[n.id] }))
+  const open = id => go('flow', id, { hours: 1, start })
+  return jsxs('div', {
+    style: { display: 'grid', gap: 14 },
+    children: [
+      failed
+        ? jsxs('div', { key: 'f', className: 'flex flex-wrap items-baseline gap-x-3', style: { fontSize: 13.5 }, children: [
+            jsx('span', { style: { color: TONE.bad }, children: `${failed} of them failed.` }),
+            jsx('button', { type: 'button', className: 'text-(--ui-accent) hover:underline', onClick: () => { haptic('tap'); onErrors() }, children: 'Show the errors' })
+          ] })
+        : drawerText('f', 'None failed.'),
+      ...FLOW_COLS.map(([col, title]) => jsx(Breakdown, { key: col, title: col === 'served' ? title : `${title} (busiest 5)`, items: top(col), of: data.total, onSelect: open }))
     ]
   })
 }
@@ -661,8 +800,13 @@ function errorRows(groups, { hours, start, flow }) {
     ] }),
     jsx('div', { style: { fontFamily: MONO, fontSize: 12, color: TONE.bad, overflowWrap: 'anywhere' }, children: g.error || `${g.event} failed` }),
     jsx('div', { style: { fontSize: 12.5, color: DIM }, children: [
-      g.profile && `profile ${g.profile}`, g.model && `model ${g.model}`, g.served && `served by ${g.served}`,
+      g.profile && `profile ${g.profile}`, g.model && `model ${g.model}`, g.served && (g.no_answer ? g.served : `served by ${g.served}`),
       g.sessions.length ? plural(g.sessions.length, 'session') : 'no session'].filter(Boolean).join(' · ') }),
+    // why they failed, as far as the metrics show: Hermes' timeout, and how busy the model was meanwhile
+    g.timeouts || g.busy ? jsx('div', { style: { fontSize: 12.5 }, children: [
+      g.timeouts && `${g.timeouts === g.count ? 'All' : `${g.timeouts} of ${g.count}`} timed out waiting for an answer (Hermes' limit for a model call)`,
+      g.busy && `about ${plural(g.busy, 'other session')} had ${g.model} calls in flight while each waited`,
+      g.answered_by && `the ones answered were served by ${g.answered_by}`].filter(Boolean).join(' · ') }) : null,
     jsxs('div', { className: 'flex flex-wrap gap-3', children: [
       g.sessions.length ? jsx(GoLink, { key: 't', tab: 'trace', sel: g.sessions[0], hours, start,
         children: g.sessions.length > 1 ? `Open the newest of ${g.sessions.length} sessions in Trace` : 'Open the session in Trace' }) : null,
@@ -671,8 +815,36 @@ function errorRows(groups, { hours, start, flow }) {
       g.host ? jsx(GoLink, { key: 'm', tab: 'topology', sel: g.platform && g.profile ? `p:${g.host}:${g.profile}` : `h:${g.host}`, at, start,
         note: `${plural(g.count, 'error')}, ${g.platform ? `${g.platform} calls` : 'router'} on ${g.host}: ${g.error || `${g.event} failed`}`,
         children: g.platform && g.profile ? `Show ${g.profile} on ${g.host} on the map` : 'Show the host on the map' }) : null
-    ] })
+    ] }),
+    jsx(FixThis, { key: 'fix', a: errorAlert(g) })
   ] }))
+}
+
+// A group of failed calls as an alert, for Fix this: one card per what failed and where.
+const errorAlert = g => {
+  const what = g.error || `${g.event} failed`
+  const when = g.first === g.last ? new Date(g.last * 1000).toLocaleString() : `${new Date(g.first * 1000).toLocaleString()} and ${new Date(g.last * 1000).toLocaleString()}`
+  return {
+    key: `errors:${g.host}:${g.platform}:${g.profile}:${g.model}:${g.event}:${what.slice(0, 80)}`,
+    text: `${plural(g.count, 'failed model call')}, ${g.platform ? `${g.platform} calls` : 'router'} on ${g.host || 'unknown host'}: ${what}`,
+    sev: 'error', source: g.platform ? `${g.platform} calls` : 'the model router', host: g.host, sessions: g.sessions,
+    intro: `Hermes Operations counted these failed model calls ${g.first === g.last ? 'at' : 'between'} ${when}:`,
+    action: [g.profile && `profile ${g.profile}`, g.model && `model ${g.model}`, g.served && (g.no_answer ? g.served : `served by ${g.served}`),
+             g.timeouts && `${g.timeouts} of ${g.count} timed out waiting for an answer (Hermes' limit for a model call)`,
+             g.busy && `about ${plural(g.busy, 'other session')} had ${g.model} calls in flight while each waited`].filter(Boolean).join('; '),
+    check: 'Find out why they failed and fix it if you can. Check first whether calls like these still fail: Errors on the Operations Overview lists them by hour.'
+  }
+}
+
+// Fix this, on a drawer or an error row: the same chat or kanban hand-off as a Needs attention card.
+function FixThis({ a, btn }) {
+  const [open, setOpen] = useState(false)
+  return jsxs('div', { className: 'grid gap-2', children: [
+    jsx('button', { key: 'b', type: 'button', 'aria-expanded': open, onClick: () => { haptic('tap'); setOpen(!open) },
+                    className: btn ? 'justify-self-start hover:bg-(--chrome-action-hover)' : 'justify-self-start text-[0.6875rem] text-(--ui-accent) hover:underline',
+                    style: btn ? BTN : undefined, children: open ? 'Hide fix options' : 'Fix this' }),
+    open ? jsx(AlertActions, { key: 'a', a }) : null
+  ] })
 }
 
 // What the tag on an attention card says: the state, in the source's own terms.
@@ -684,7 +856,7 @@ function attentionTag(it) {
 }
 
 // A health finding names a session by the start of its id ("session 20261006_101700_96faea… at 86k tok").
-const findingSession = it => it.source?.startsWith('health') && it.ts ? /\bsession (\S{8,}?)(?:…|\s|$)/.exec(it.text)?.[1] : null
+const findingSession = it => it.source?.startsWith('health') && it.ts ? /(?:\bsession|\bloop:) (\S{8,}?)(?:…|\s|$)/.exec(it.text)?.[1] : null
 
 const useFindSession = it => {
   const prefix = findingSession(it)
@@ -692,12 +864,21 @@ const useFindSession = it => {
                     queryFn: () => api.rest(`/find-session?prefix=${encodeURIComponent(prefix)}&before=${it.ts}`) })
 }
 
-// The finding's session, found by that id, opened in Trace on the hours it ran.
-function SessionLink({ it }) {
-  const s = useFindSession(it).data?.session
-  if (!s) return null
-  const start = Math.floor(s.start / 3600) * 3600
-  return jsx(GoLink, { tab: 'trace', sel: s.session_id, start, hours: Math.min(168, Math.max(1, Math.ceil((s.end - start) / 3600))), children: 'Open the session in Trace' })
+// The finding's session, found by that id, opened in Trace on the hours it ran. As a drawer's buttons
+// (btn) it also selects the session's profile on the map over the session, or its last hour if longer;
+// a session not found falls back to the map when the finding started (it reaches back 7 days).
+function SessionLink({ it, btn }) {
+  const { data, isLoading } = useFindSession(it)
+  const s = data?.session
+  const started = btn && !isLoading && Date.now() / 1000 - it.ts <= 168 * 3600
+    ? jsx(GoLink, { key: 'm', btn, tab: 'topology', at: it.ts, children: 'See the map when it started' }) : null
+  if (!s) return started
+  const start = Math.floor(s.start / 3600) * 3600, end = Math.ceil(s.end)
+  const trace = jsx(GoLink, { key: 't', btn, tab: 'trace', sel: s.session_id, start, hours: Math.min(168, Math.max(1, Math.ceil((s.end - start) / 3600))), children: 'Open the session in Trace' })
+  if (!btn) return trace
+  if (!s.host) return [trace, started]
+  return [trace, jsx(GoLink, { key: 'm', btn, tab: 'topology', sel: s.profile ? `p:${s.host}:${s.profile}` : `h:${s.host}`, at: end, start: Math.max(Math.floor(s.start), end - 3600),
+                               note: `session ${s.session_id}`, children: 'See its profile on the map' })]
 }
 
 // Where an attention item can be seen in Operations: its card in Handoffs, its host or gateway on the map, or its session in Trace.
@@ -909,16 +1090,19 @@ const servedColors = ids => {
   return Object.fromEntries(ids.map(id => [id, SERVED_COLORS[seen[id]]]))
 }
 const pct = (n, of) => (of ? Math.round((n / of) * 100) : 0)
+// Fit to screen: the chart takes the page's width and its side panel moves below it; this Desktop remembers it
+const FLOW_FIT = 'flow.fit'
 
-function FlowChart({ nodes, paths, total, sel, onSelect, color, live }) {
+function FlowChart({ nodes, paths, total, sel, onSelect, color, live, wide }) {
   // LABEL: a small node still takes a label's height in the layout, so labels never overlap
   const NW = 10, GAP = 6, LABEL = 14
   const cols = FLOW_COLS.map(([c]) => nodes.filter(n => n.col === c))
   // the served column's labels sit right of its bars, so the model labels have the whole gap to
-  // them; the bands give up the longest one's width (about 6.6px a character at 12px)
+  // them; the bands give up the longest one's width (about 7.2px a character at 13px)
   const R = Math.max(0, ...cols[3].map(n => Math.max(`${n.label} ${n.requests}${n.errors ? ` · ${n.errors} failed` : ''}`.length,
-                                                     `${n.label} ${n.requests} of ${n.requests}`.length))) * 6.6 + 8
-  const W = 960 - R
+                                                     `${n.label} ${n.requests} of ${n.requests}`.length))) * 7.2 + 8
+  // fit to screen draws on a wider canvas: the chart fills the page without its bands and labels growing past reading size
+  const W = (wide ? 1240 : 960) - R
   const k = 240 / total
   const slot = n => Math.max(LABEL, n.requests * k)
   const span = col => col.reduce((a, n) => a + slot(n), 0) + GAP * (col.length - 1)
@@ -973,7 +1157,7 @@ function FlowChart({ nodes, paths, total, sel, onSelect, color, live }) {
             ...Object.entries(l.by).map(([id, n]) => {
               const d = band(n * k, o)
               o += n * k
-              return jsx('path', { key: `${l.a}>${l.b}:${id}`, fill: color(id), opacity: 0.7, d, children: jsx('title', { children: `${tip}; ${n} served by ${pos[id].n.label}` }) })
+              return jsx('path', { key: `${l.a}>${l.b}:${id}`, fill: color(id), opacity: 0.5, d, children: jsx('title', { children: `${tip}; ${n} served by ${pos[id].n.label}` }) })
             })
           ]
         }),
@@ -1008,10 +1192,10 @@ function FlowChart({ nodes, paths, total, sel, onSelect, color, live }) {
                 y: f(p.y + Math.max(2, p.h) / 2 + 4),
                 fill: p.n.id === sel ? 'var(--ui-accent)' : 'currentColor',
                 // a halo in the page's color keeps the label readable where it crosses a band
-                stroke: 'var(--ui-bg, #0d1117)', strokeWidth: 3, strokeLinejoin: 'round', paintOrder: 'stroke',
-                fontSize: 12,
+                stroke: 'var(--ui-bg, #0d1117)', strokeWidth: 2.5, strokeLinejoin: 'round', paintOrder: 'stroke',
+                fontSize: 13,
                 fontWeight: p.n.id === sel ? 600 : 400,
-                opacity: off ? 0.3 : 1,
+                opacity: off ? 0.5 : 1,
                 children: sel && !off && thru[p.n.id] < p.n.requests
                   ? [`${name} ${thru[p.n.id]}`, jsx('tspan', { key: 'of', opacity: 0.5, children: ` of ${p.n.requests}` })]
                   : [`${name} ${p.n.requests}`, p.n.errors ? jsx('tspan', { key: 'e', fill: TONE.bad, children: ` · ${p.n.errors} failed` }) : null]
@@ -1055,7 +1239,10 @@ function Breakdown({ title, items, of, onSelect }) {
   })
 }
 
-function FlowDetail({ nodes, paths, total, sel, onSelect, color, hours, start }) {
+// A served node is a pool device, a cloud provider, or the calls that failed before anything answered.
+const servedKind = n => (n.no_answer ? 'no answer' : n.pool_device ? 'pool device' : 'provider')
+
+function FlowDetail({ nodes, paths, total, sel, onSelect, color, hours, start, wide }) {
   const byId = Object.fromEntries(nodes.map(n => [n.id, n]))
   const node = sel && byId[sel]
   if (!node)
@@ -1073,10 +1260,9 @@ function FlowDetail({ nodes, paths, total, sel, onSelect, color, hours, start })
     })
   const through = paths.filter(p => p.ids.includes(sel))
   const colName = Object.fromEntries(FLOW_COLS)
-  return jsxs('div', {
-    className: 'space-y-3',
-    children: [
+  const summary = [
       jsxs('div', {
+        key: 'about',
         className: 'space-y-0.5 text-xs',
         children: [
           jsxs('div', {
@@ -1084,7 +1270,7 @@ function FlowDetail({ nodes, paths, total, sel, onSelect, color, hours, start })
             children: [
               node.col === 'served' ? jsx('span', { style: { width: 8, height: 8, flex: 'none', backgroundColor: color(node.id) } }) : null,
               jsx('span', { className: 'font-semibold', style: { color: 'var(--ui-accent)' }, children: node.label }),
-              node.col === 'served' ? jsx(KindBox, { children: node.pool_device ? 'pool device' : 'provider' }) : null
+              node.col === 'served' ? jsx(KindBox, { children: servedKind(node) }) : null
             ]
           }),
           jsxs('div', { className: 'text-(--ui-text-quaternary)', children: [
@@ -1092,13 +1278,16 @@ function FlowDetail({ nodes, paths, total, sel, onSelect, color, hours, start })
             jsx('span', { style: node.errors ? { color: TONE.bad, fontWeight: 500 } : undefined, children: plural(node.errors, 'error') }),
             ` · p95 ${fmtDur(node.p95_s)}`
           ] }),
-          node.col === 'served' ? jsx(GoLink, { tab: 'topology', sel: `s:${node.id.slice('served:'.length)}`, hours, children: 'Show on the map' }) : null
+          node.no_answer ? muted('Calls that failed before anything answered them. The model they asked for shows where the rest went.')
+          : node.col === 'served' ? jsx(GoLink, { tab: 'topology', sel: `s:${node.id.slice('served:'.length)}`, hours, children: 'Show on the map' }) : null
         ]
       }),
-      node.errors ? jsx(FlowErrors, { node, hours, start }) : null,
+      node.errors ? jsx(FlowErrors, { key: 'errors', node, hours, start }) : null]
+  const routes = [
       // every request took one route: name it in a line instead of lists that each read 100%
       through.length === 1
         ? jsxs('div', {
+            key: 'route',
             className: 'text-xs leading-relaxed',
             children: [
               muted('Every request took one route:'),
@@ -1121,9 +1310,15 @@ function FlowDetail({ nodes, paths, total, sel, onSelect, color, hours, start })
           .map(([id, n]) => ({ id, label: byId[id]?.label ?? id, n, color: c === 'served' ? color(id) : undefined }))
         const before = j < FLOW_COLS.findIndex(([x]) => x === node.col)
         return jsx(Breakdown, { key: c, title: `${before ? 'From' : 'To'}: ${colName[c].toLowerCase()}`, items, of: node.requests, onSelect })
-      }))
-    ]
-  })
+      }))]
+  // below a full-width chart: what it is and what failed on the left, where its requests went on the right
+  return wide
+    ? jsxs('div', {
+        className: 'grid gap-x-8 gap-y-3',
+        style: { gridTemplateColumns: 'repeat(auto-fit, minmax(20rem, 1fr))' },
+        children: [jsx('div', { key: 's', className: 'space-y-3', children: summary }), jsx('div', { key: 'r', className: 'space-y-3', children: routes })]
+      })
+    : jsxs('div', { className: 'space-y-3', children: [...summary, ...routes] })
 }
 
 // What failed among the selection's requests: the window's errors from a client on the same entry point, profile, model or server.
@@ -1224,6 +1419,8 @@ function FlowPage({ sel: initial, when = {}, remember }) {
   const [start, setStart] = useState(when.start ?? null)
   const pickHours = h => { setHours(h); setStart(null) }
   const [selected, setSelected] = useState(initial)
+  const [fit, setFit] = useState(() => storeGet(FLOW_FIT, false))
+  const toggleFit = () => { haptic('tap'); try { api.storage.set(FLOW_FIT, !fit) } catch {} setFit(!fit) }
   remember?.({ sel: selected, when: { hours, start } })
   const { data, isLoading, isError } = useFlow(hours, start)
   if (isError) return jsx('div', { className: 'p-4', children: muted('Flow unavailable: the /api/plugins/operations backend did not respond.') })
@@ -1237,7 +1434,7 @@ function FlowPage({ sel: initial, when = {}, remember }) {
   const args = { nodes, paths: data.paths || [], total: data.total, sel, onSelect: setSelected, color, hours, start }
   const node = sel && nodes.find(n => n.id === sel)
   const KINDS = { entry: 'entry point', profile: 'profile', model: 'model', served: 'served by' }
-  const kind = node && (node.col === 'served' ? (node.pool_device ? 'pool device' : 'provider') : KINDS[node.col])
+  const kind = node && (node.col === 'served' ? servedKind(node) : KINDS[node.col])
   // a link can name something with no requests in this window: say so rather than quietly show everything
   const missing = selected && !node && selected.slice(selected.indexOf(':') + 1)
   const missingKind = missing && KINDS[selected.slice(0, selected.indexOf(':'))]
@@ -1285,13 +1482,29 @@ function FlowPage({ sel: initial, when = {}, remember }) {
       jsx(Section, {
         title: 'Request flow',
         count: `${node ? `${node.requests} of ${data.total} requests through ${node.label}` : `${data.total ?? 0} requests`} · ${start ? `${fmtClock(start)} to ${fmtClock(start + hours * 3600)}` : `last ${hours}h`} · band width is request count`,
+        action: data.total
+          ? jsxs('button', {
+              type: 'button',
+              onClick: toggleFit,
+              'aria-pressed': fit,
+              title: fit ? 'Put the details back beside the chart' : 'Give the chart the full width, with the details below it',
+              className: 'flex items-center gap-1.5 rounded px-2 py-0.5 text-[0.6875rem] font-medium text-(--ui-accent) transition-colors hover:bg-(--chrome-action-hover)',
+              style: { border: '1px solid color-mix(in srgb, var(--ui-accent) 50%, transparent)' },
+              children: [
+                // arrows out to the corners to fit; in from them to go back
+                jsx('svg', { key: 'i', width: 12, height: 12, viewBox: '0 0 12 12', fill: 'none', stroke: 'currentColor', strokeWidth: 1.4, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true,
+                             children: jsx('path', { d: fit ? 'M1 4h3V1M11 4H8V1M1 8h3v3M11 8H8v3' : 'M1 4V1h3M8 1h3v3M1 8v3h3M11 8v3H8' }) }),
+                fit ? 'Side by side' : 'Fit to screen'
+              ]
+            })
+          : null,
         error: err.flow,
         children: data.total
           ? jsxs('div', {
               className: 'flex flex-wrap gap-4',
               children: [
-                jsx('div', { style: { flex: '3 1 32rem', minWidth: 0 }, children: jsx(FlowChart, { ...args, live: start == null }) }),
-                jsx('div', { style: { flex: '1 1 14rem', minWidth: 0 }, children: jsx(FlowDetail, args) })
+                jsx('div', { style: { flex: fit ? '1 1 100%' : '3 1 32rem', minWidth: 0 }, children: jsx(FlowChart, { ...args, live: start == null, wide: fit }) }),
+                jsx('div', { style: { flex: fit ? '1 1 100%' : '1 1 14rem', minWidth: 0 }, children: jsx(FlowDetail, { ...args, wide: fit }) })
               ]
             })
           : muted('No requests in this window.')
@@ -1946,12 +2159,19 @@ const fmtTok = n => (n == null ? '-' : n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n
 function SessionTrace({ sid, onOpen, drawer, fitH }) {
   const { data, isLoading, isError } = useSessionTrace(sid)
   const [pick, setPick] = useState(null)
+  // the summaries model's reading of this session: null, 'asking', or the route's answer
+  const [explained, setExplained] = useState(null)
   if (isError) return muted('This session did not load.')
   if (isLoading || !data) return jsx(Skeleton, { className: 'h-32 w-full' })
   const calls = data.calls || []
   if (!calls.length) return muted(data.errors?.trace ? `Unavailable: ${data.errors.trace}` : 'No model calls recorded for this session.')
   const t0 = Math.min(...calls.map(c => c.start)), t1 = Math.max(...calls.map(c => c.end))
   const failed = calls.filter(c => c.error).length
+  // a request is its attempts (a failed call Hermes retried); one whose last attempt failed got no answer at all
+  const lastTry = calls.filter(c => c.attempt === c.attempts)
+  const retried = lastTry.filter(c => c.attempts > 1 && !c.error).length
+  const lost = lastTry.filter(c => c.error).length
+  const outcome = [retried && `${plural(retried, 'request')} answered on a retry`, lost && `${plural(lost, 'request')} failed`].filter(Boolean).join(', ')
   const name = (c, i) => `${c.turn}.${i + 1}`
   const color = c => (c.error ? TONE.bad : c.pool_device ? TONE.good : TONE.info)
   // The axis runs to a round number of ticks past the last call, so the gridlines fall on the ticks.
@@ -1988,7 +2208,7 @@ function SessionTrace({ sid, onOpen, drawer, fitH }) {
     drawer ? null : jsx('span', { key: 'sid', style: { marginTop: -6, fontFamily: MONO, fontSize: 11, color: 'var(--ui-text-quaternary)', overflowWrap: 'anywhere' }, children: sid }),
     kv([
       ['Total', fmtDur(t1 - t0)],
-      ['Calls', `${calls.length}${failed ? `, ${failed} failed` : ''}`],
+      ['Calls', `${calls.length}${failed ? `, ${failed} failed${outcome ? ` (${outcome})` : ''}` : ''}`],
       ['Model time', fmtDur(modelTime)],
       ['Between calls', fmtDur(Math.max(0, t1 - t0 - modelTime))],
       ['Tokens', tokens(sum('input_tokens'), sum('output_tokens'), sum('cache_read_tokens'), sum('reasoning_tokens'))],
@@ -2007,18 +2227,41 @@ function SessionTrace({ sid, onOpen, drawer, fitH }) {
           ]
         })
       : null,
+    jsxs('div', {
+      key: 'explain',
+      className: 'grid',
+      style: { gap: 6 },
+      children: [
+        explained?.text
+          ? jsx('p', { key: 't', style: { margin: 0, fontSize: 13.5, lineHeight: 1.6, textWrap: 'pretty' }, children: explained.text })
+          : explained?.errors?.model ? drawerText('e', `Could not explain it: ${explained.errors.model}`) : null,
+        explained?.text ? jsx('span', { key: 'm', style: { fontSize: 11, color: 'var(--ui-text-quaternary)' }, children: `Written by ${explained.model}${explained.provider ? ` via ${explained.provider}` : ''} from this trace; check it against the calls.` }) : null,
+        jsx('div', { key: 'b', children: btn('x', explained === 'asking' ? 'Explaining...' : explained ? 'Explain again' : 'Explain this session', async () => {
+          if (explained === 'asking') return
+          haptic('tap')
+          setExplained('asking')
+          try {
+            setExplained(await api.rest(`/trace/${encodeURIComponent(sid)}/explain`, { method: 'POST', body: {}, timeoutMs: 120_000 }))
+          } catch (e) {
+            setExplained({ errors: { model: e?.message || 'the backend did not respond' } })
+          }
+        }) })
+      ]
+    }),
     jsx('p', { key: 'hint', style: { margin: 0, color: DIM }, children: 'Select a call for its details.' })
   ]
   const detail = cur && [
     sideTitle(`Call ${name(cur, pick)}`),
     jsx('span', { key: 'm', style: { marginTop: -6, fontFamily: MONO, fontSize: 13, fontWeight: 600, overflowWrap: 'anywhere' }, children: cur.model || 'no model' }),
     kv([
-      ['Served by', `${cur.served} (${cur.pool_device ? 'pool device' : 'cloud provider'})`],
+      ['Served by', cur.no_answer ? `nothing answered (sent to ${cur.via || 'an unrecorded provider'})`
+        : `${cur.served} (${cur.pool_device ? 'pool device' : 'cloud provider'})`],
       ['From host', cur.host],
       ['Starts at', `+${fmtDur(cur.start - t0)}`],
       ['Took', `${fmtDur(cur.duration_s)}${cur.usual_s != null ? `, usually ${fmtDur(cur.usual_s)}` : ''}`],
+      ['Request', cur.attempts > 1 ? `attempt ${cur.attempt} of ${cur.attempts}, from call ${name(calls[cur.first], cur.first)}${cur.attempt > 1 ? `; waiting ${fmtDur(cur.end - calls[cur.first].start)} in all` : ''}` : null],
       ['First token', cur.ttft_s != null ? fmtDur(cur.ttft_s) : null],
-      ['Tokens', tokens(cur.input_tokens, cur.output_tokens, cur.cache_read_tokens, cur.reasoning_tokens)],
+      ['Tokens', cur.no_answer ? 'none: no answer came back' : tokens(cur.input_tokens, cur.output_tokens, cur.cache_read_tokens, cur.reasoning_tokens)],
       ['Speed', cur.tps != null ? `${cur.tps} tokens/s` : null],
       ['Finish', cur.finish_reason],
       ['Error', cur.error]
@@ -2042,12 +2285,20 @@ function SessionTrace({ sid, onOpen, drawer, fitH }) {
       : cur.usual_n != null
         ? drawerText('vs', `No typical time yet: ${plural(cur.usual_n, 'call')} like this one (same model and server, similar output length) in the week before it; it takes 5.`)
         : null,
+    // what a failed call ran into, worked out by the backend: a timeout, its retries, how busy its model was
+    cur.context?.length ? drawerPart('ctx', 'What happened', jsx('div', { className: 'grid', style: { gap: 4, fontSize: 13, lineHeight: 1.5 }, children: cur.context.map((x, i) => jsx('p', { key: i, style: { margin: 0 }, children: x })) })) : null,
     jsxs('div', {
       key: 'go',
       className: 'flex flex-wrap gap-2',
       children: [
-        jsx(GoLink, { key: 'map', btn: true, tab: 'topology', sel: `s:${cur.served}`, at: cur.start, children: 'Show on the map' }),
-        jsx(GoLink, { key: 'flow', btn: true, tab: 'flow', sel: `served:${cur.served}`, at: cur.start, children: 'See its traffic' }),
+        // nothing served a call with no answer: its host is on the map, and its traffic is its model's around then
+        cur.no_answer
+          ? jsx(GoLink, { key: 'map', btn: true, tab: 'topology', sel: cur.host ? `h:${cur.host}` : null, at: cur.start, children: 'Show its host on the map' })
+          : jsx(GoLink, { key: 'map', btn: true, tab: 'topology', sel: `s:${cur.served}`, at: cur.start, children: 'Show on the map' }),
+        cur.no_answer && cur.model
+          ? jsx(GoLink, { key: 'flow', btn: true, tab: 'flow', sel: `model:${cur.model}`, start: Math.floor(cur.start / 3600) * 3600 - 3600,
+              hours: Math.min(168, Math.ceil((cur.end + 3600 - (Math.floor(cur.start / 3600) * 3600 - 3600)) / 3600)), children: `See ${cur.model} traffic around then` })
+          : jsx(GoLink, { key: 'flow', btn: true, tab: 'flow', sel: `served:${cur.served}`, at: cur.start, children: 'See its traffic' }),
         btn('back', 'Back to the session', () => setPick(null))
       ]
     })
@@ -2061,7 +2312,7 @@ function SessionTrace({ sid, onOpen, drawer, fitH }) {
       data.why?.length
         ? jsx(Section, {
             title: `Why it took ${fmtDur(t1 - t0)}`,
-            count: failed ? `${failed} failed` : null,
+            count: failed ? `${failed} failed${outcome ? `: ${outcome}` : ''}` : null,
             children: jsxs('div', {
               className: 'grid',
               style: { gap: 10 },
@@ -2125,7 +2376,8 @@ function SessionTrace({ sid, onOpen, drawer, fitH }) {
                       style: { padding: '3px 10px 3px 0', fontFamily: MONO, fontSize: 12, lineHeight: 1.3 },
                       children: [
                         jsx('span', { className: 'block truncate', children: `${name(c, i)}  ${c.model || 'no model'}` }),
-                        jsx('span', { className: 'block truncate', style: { fontSize: 11, color: 'var(--ui-text-quaternary)' }, children: `on ${c.served}` })
+                        jsx('span', { className: 'block truncate', style: { fontSize: 11, color: 'var(--ui-text-quaternary)' },
+                          children: `${c.no_answer ? 'no answer' : `on ${c.served}`}${c.attempts > 1 ? ` · attempt ${c.attempt} of ${c.attempts}` : ''}` })
                       ]
                     }),
                     jsxs('span', {
@@ -2137,7 +2389,7 @@ function SessionTrace({ sid, onOpen, drawer, fitH }) {
                           className: 'absolute whitespace-nowrap',
                           style: { top: 'calc(50% - 10px)', fontFamily: MONO, fontSize: 11, lineHeight: '20px', color: i === pick ? undefined : DIM,
                                    ...(end > 0.85 ? { right: `calc(${100 - ((c.start - t0) / max) * 100}% + 6px)` } : { left: `calc(${end * 100}% + 6px)` }) },
-                          children: c.error ? 'failed' : fmtDur(c.duration_s)
+                          children: c.error ? (c.timed_out ? `timed out at ${fmtDur(c.duration_s)}` : 'failed') : fmtDur(c.duration_s)
                         })
                       ]
                     })
@@ -3678,7 +3930,7 @@ function TopologyPage({ sel: initial, when = {}, remember }) {
   if (isError) return jsx('div', { className: 'p-4', children: muted('Topology unavailable: the /api/plugins/operations backend did not respond.') })
   if (isLoading || !live) return jsx('div', { className: 'p-4', children: jsx(Skeleton, { className: 'h-48 w-full' }) })
   const t0 = from ?? Math.floor(live.timeline?.since || end - hours * 3600)
-  const top = from ? Math.min(from + 3600, end) : end
+  const top = from ? Math.min(when.at ?? from + 3600, end) : end
   const data = topologyAt(live, at && at < end ? at : null, from)
   const fmt = ts => (hours > 24 ? new Date(ts * 1000).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' }) : fmtClock(ts))
   const flow = !!FLOW_LAYOUT[layout]
@@ -3763,7 +4015,7 @@ function TopologyPage({ sel: initial, when = {}, remember }) {
               : { border: '1px solid color-mix(in srgb, var(--ui-accent) 50%, transparent)', backgroundColor: 'color-mix(in srgb, var(--ui-accent) 10%, transparent)' },
             children: [
               when.note ? jsx('span', { children: 'From' }) : null,
-              when.note && when.start != null ? jsx('span', { className: 'tabular-nums', style: { fontFamily: MONO, color: 'var(--ui-accent)' }, children: `${fmtClock(when.start)} to ${fmtClock(when.start + 3600)}` }) : null,
+              when.note && when.start != null ? jsx('span', { className: 'tabular-nums', style: { fontFamily: MONO, color: 'var(--ui-accent)' }, children: `${fmtClock(when.start)} to ${fmtClock(when.at ?? when.start + 3600)}` }) : null,
               when.note ? jsx('span', { className: 'min-w-0', style: { overflowWrap: 'anywhere' }, children: `${when.note}.` }) : null,
               picked
                 ? jsx('span', { children: ['Selected ', jsx('b', { key: 'n', style: { color: 'var(--ui-accent)' }, children: picked.full }), ` as of ${data.at ? fmt(data.at) : 'now'}.`] })
@@ -4660,6 +4912,7 @@ const SETTINGS_PATH = `/settings?tab=plugins&plugin=${ID}`
 const settingsCmd = (s, key, value) => `hermes -p ${s.profile} config set plugins.entries.${ID}.settings.${key} ${value}`
 const settingsHint = (s, key, value) => s.settings_page ? '' : ` In this profile, run: ${settingsCmd(s, key, value)}`
 const SETUP_HIDDEN = 'setup.hidden'
+const SETUP_COLLAPSED = 'setup.collapsed'
 const useSetup = () => useQuery({ queryKey: [ID, 'setup'], queryFn: () => api.rest('/setup'), staleTime: 60_000 })
 
 // What a first run still needs, each with where to fix it. Discord alerts are optional and never
@@ -4715,15 +4968,32 @@ function setupToast(ctx) {
 function SetupChecklist() {
   const { data } = useSetup()
   const [hidden, setHidden] = useState(() => { try { return api.storage.get(SETUP_HIDDEN, false) } catch { return false } })
+  const [collapsed, setCollapsed] = useState(() => storeGet(SETUP_COLLAPSED, false))
   if (!data || hidden) return null
   const steps = setupSteps(data)
   const left = steps.filter(x => !x.done).length
   if (!left) return null
   const hide = () => { setHidden(true); try { api.storage.set(SETUP_HIDDEN, true) } catch {} }
+  const toggle = () => { haptic('tap'); try { api.storage.set(SETUP_COLLAPSED, !collapsed) } catch {} setCollapsed(!collapsed) }
   return jsx(Section, {
     title: 'Set up Operations',
-    count: `${left} of ${steps.filter(x => !x.optional).length} left`,
-    children: jsxs('div', { className: 'space-y-2 text-xs', children: [
+    count: `${left} of ${steps.filter(x => !x.optional).length} steps to do`,
+    action: jsxs('button', {
+      type: 'button',
+      onClick: toggle,
+      'aria-expanded': !collapsed,
+      className: 'flex items-center gap-1.5 rounded px-1.5 py-0.5 text-[0.6875rem] text-(--ui-accent) hover:bg-(--chrome-action-hover)',
+      children: [
+        // a CSS triangle: down while open, right while collapsed
+        jsx('span', { key: 'v', 'aria-hidden': true, style: collapsed
+          ? { borderTop: '4px solid transparent', borderBottom: '4px solid transparent', borderLeft: '5px solid currentColor' }
+          : { borderLeft: '4px solid transparent', borderRight: '4px solid transparent', borderTop: '5px solid currentColor' } }),
+        collapsed ? 'Show' : 'Collapse'
+      ]
+    }),
+    children: collapsed
+      ? jsx('div', { className: 'truncate text-xs text-(--ui-text-quaternary)', children: `Still to do: ${steps.filter(x => !x.done).map(x => x.title).join(', ')}` })
+      : jsxs('div', { className: 'space-y-2 text-xs', children: [
       ...steps.map(x => jsxs('div', { key: x.id, className: 'flex items-start gap-2', children: [
         jsx('span', { style: { marginTop: 3, width: 8, height: 8, flex: 'none', borderRadius: 4, border: `1.5px solid ${x.done ? TONE.good : TONE.warn}`, backgroundColor: x.done ? TONE.good : 'transparent' } }),
         jsxs('div', { className: 'flex-1 space-y-0.5', children: [
@@ -5013,12 +5283,14 @@ const isUnread = (a, readAt) => !a.read && a.at > readAt
 const unreadAlerts = () => storeGet(ALERT_LOG, []).filter(a => isUnread(a, storeGet(ALERT_READ, 0))).length
 
 // What a chat or a card is told about one alert. The alert may have cleared since it was raised.
+// A group of failed calls (errorAlert) brings its own opening, sessions and check.
 const alertBrief = (a, tail, session) => [
-  a.at ? `Hermes Operations raised this alert at ${new Date(a.at).toLocaleString()}:` : 'Hermes Operations lists this under Needs attention:', '', a.text, '',
+  a.intro || (a.at ? `Hermes Operations raised this alert at ${new Date(a.at).toLocaleString()}:` : 'Hermes Operations lists this under Needs attention:'), '', a.text, '',
   `Severity: ${a.sev}. Source: ${a.source}.${a.host ? ` Host: ${a.host}.` : ''}${a.ts ? ` Ongoing since ${new Date(a.ts * 1000).toLocaleString()}.` : ''}`,
   session ? `Session: ${session.session_id}, ${new Date(session.start * 1000).toLocaleString()} to ${new Date(session.end * 1000).toLocaleString()}.` : null,
-  a.action ? `Suggested next step: ${a.action}` : null, '',
-  'Find out why it happened and fix it if you can. Check first whether it is still happening: it is listed under Needs attention on the Operations Overview while it is.' + (tail ? ` ${tail}` : '')
+  a.sessions?.length ? `Sessions, newest first: ${a.sessions.slice(0, 10).join(', ')}${a.sessions.length > 10 ? ` and ${a.sessions.length - 10} more` : ''}.` : null,
+  a.action ? `${a.intro ? 'Seen' : 'Suggested next step'}: ${a.action}` : null, '',
+  (a.check || 'Find out why it happened and fix it if you can. Check first whether it is still happening: it is listed under Needs attention on the Operations Overview while it is.') + (tail ? ` ${tail}` : '')
 ].filter(x => x !== null).join('\n')
 
 // Two ways to get an alert fixed, on Notifications and Overview: a new chat with the alert written

@@ -1,9 +1,13 @@
 import importlib.util
+import io
+import json
 import sqlite3
 import tempfile
 import time
 import unittest
+import urllib.error
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location(
@@ -99,6 +103,17 @@ class OverviewTest(unittest.TestCase):
         self.assertIn("host:mbp", [i["key"] for i in items])
         self.assertEqual(len({i["key"] for i in items}), len(items))
 
+    def test_a_health_finding_dates_from_the_first_check_of_its_run(self):
+        m = sqlite3.connect(self.metrics)
+        for ts in (NOW - 9000, NOW - 3000, NOW - 1000):
+            m.execute("INSERT INTO health_findings (ts, window_hours, rule, sev, text, action)"
+                      " VALUES (?, 6, 'R1', 'crit', 'summarizer not loaded', 'load it')", (ts,))
+        m.commit()
+        m.close()
+        r1 = next(i for i in api.overview(24)["attention"] if i["key"] == "health:R1")
+        # the check at NOW - 5000 saw only R9, so the run that is still open began at NOW - 3000
+        self.assertEqual(r1["ts"], NOW - 3000)
+
     def test_hosts_and_current_pool_only(self):
         h = api.overview(24)["hosts"]
         self.assertEqual([(x["host"], x["stale"]) for x in h["hosts"]], [("mbp", True), ("mini", False)])
@@ -160,6 +175,111 @@ class OverviewTest(unittest.TestCase):
         before = self.metrics.read_bytes(), self.kanban.read_bytes()
         api.overview(24)
         self.assertEqual((self.metrics.read_bytes(), self.kanban.read_bytes()), before)
+
+    def test_a_finding_about_a_router_role_names_it(self):
+        m = sqlite3.connect(self.metrics)
+        m.execute("INSERT INTO health_findings (ts, window_hours, rule, sev, text, action) VALUES (?, 6, 'R2', 'crit',"
+                  " 'compression role hermes/compressor has no loaded model (candidates: a)', '')", (NOW - 100,))
+        m.commit()
+        m.close()
+        items = {i["key"]: i for i in api.overview(24)["attention"]}
+        self.assertEqual(items["health:R2"]["role"], "hermes/compressor")
+        self.assertNotIn("role", items["health:R1"])
+
+
+ROUTER_STATUS = {
+    "roles": {"hermes/compressor": {"min_context": 64000, "candidates_detail": [
+        {"id": "small", "live": False, "fit": None}, {"id": "big", "live": False, "fit": None}]}},
+    "loaded": {"other": 80000, "tiny": 8192}}
+LMSTUDIO = {"models": [{"key": "small", "type": "llm", "loaded_instances": []},
+                       {"key": "big", "type": "llm", "loaded_instances": []},
+                       # the same model on a second LM Link device, loaded there
+                       {"key": "big", "type": "llm", "loaded_instances": [{"id": "big"}]},
+                       {"key": "other", "type": "llm", "loaded_instances": [{"id": "other"}]}]}
+
+
+class ModelActionsTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.config = root / "router-config.json"
+        self.config.write_text(json.dumps({"roles": {"hermes/compressor": {
+            "candidates": [{"model": "small"}, {"model": "big", "note": "kept"}], "min_context": 64000}}}))
+        (root / "writer.yaml").write_text("mcp_servers:\n  roles:\n    command: python3\n    args: [/x/rolectl-mcp.py]\n"
+                                          "    env: {ROLECTL_MCP_ALLOW_WRITE: '1'}\n")
+        (root / "reader.yaml").write_text("mcp_servers:\n  roles: {command: /x/rolectl-mcp.py}\n")
+        self.calls, self.lmstudio_up, self.reload = [], True, b'{"ok": true}'
+
+        def fake_urlopen(req, timeout):
+            url = req if isinstance(req, str) else req.full_url
+            body = None if isinstance(req, str) or req.data is None else json.loads(req.data)
+            self.calls.append((url, body))
+            if url.endswith("/router/status"):
+                return io.BytesIO(json.dumps(ROUTER_STATUS).encode())
+            if url.endswith("/router/reload"):
+                return io.BytesIO(self.reload)
+            if not self.lmstudio_up:
+                raise urllib.error.URLError("connection refused")
+            if url.endswith("/api/v1/models"):
+                return io.BytesIO(json.dumps(LMSTUDIO).encode())
+            return io.BytesIO(json.dumps({"load_config": {"context_length": body["context_length"]}}).encode())
+        for p in (mock.patch.object(api.urllib.request, "urlopen", fake_urlopen),
+                  mock.patch.object(api, "_ROUTER_CONFIG", self.config),
+                  mock.patch.object(api, "_profile_config", lambda p: root / f"{p}.yaml"),
+                  mock.patch.object(api.kanban_db, "list_profiles_on_disk", lambda: ["default", "reader", "writer"]),
+                  mock.patch.dict(api.os.environ, {"MODEL_ROUTER_TOKEN": "t"})):
+            p.start()
+            self.addCleanup(p.stop)
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_each_way_is_on_when_it_can_work(self):
+        st = api.model_role("hermes/compressor")
+        # big is loaded on another device already; tiny has too little context for the role
+        self.assertEqual(st["lmstudio"], {"on": True, "models": ["small"], "note": ""})
+        self.assertEqual(st["repoint"]["models"], ["other"])
+        self.assertEqual(st["agent"]["profiles"], ["writer"])
+
+    def test_off_ways_say_why(self):
+        self.lmstudio_up = False
+        api._profile_config = lambda p: Path(self.tmp.name) / "reader.yaml"
+        st = api.model_role("hermes/compressor")
+        self.assertFalse(st["lmstudio"]["on"])
+        self.assertIn("lms server start", st["lmstudio"]["note"])
+        self.assertFalse(st["agent"]["on"])
+        self.assertIn("ROLECTL_MCP_ALLOW_WRITE", st["agent"]["note"])
+        with self.assertRaises(api.HTTPException) as cm:
+            api.model_role("no/such-role")
+        self.assertEqual(cm.exception.status_code, 404)
+
+    def test_load_asks_lm_studio_for_the_context_the_role_needs(self):
+        out = api.load_model("hermes/compressor", "small")
+        self.assertEqual((out["model"], out["context_length"]), ("small", 64000))
+        self.assertEqual(self.calls[-1], ("http://127.0.0.1:1234/api/v1/models/load",
+                                          {"model": "small", "echo_load_config": True, "context_length": 64000}))
+        with self.assertRaises(api.HTTPException) as cm:
+            api.load_model("hermes/compressor", "other")
+        self.assertEqual(cm.exception.status_code, 400)
+
+    def test_repoint_puts_the_model_first_backs_up_and_reloads(self):
+        before = self.config.read_text()
+        api.repoint_role("hermes/compressor", "other")
+        cands = json.loads(self.config.read_text())["roles"]["hermes/compressor"]["candidates"]
+        self.assertEqual(cands, [{"model": "other"}, {"model": "small"}, {"model": "big", "note": "kept"}])
+        backups = list(self.config.parent.glob("router-config.json.bak.*"))
+        self.assertEqual([b.read_text() for b in backups], [before])
+        self.assertTrue(self.calls[-1][0].endswith("/router/reload"))
+
+    def test_repoint_refuses_a_model_without_the_context(self):
+        before = self.config.read_text()
+        with self.assertRaises(api.HTTPException):
+            api.repoint_role("hermes/compressor", "tiny")
+        self.assertEqual(self.config.read_text(), before)
+
+    def test_repoint_reports_a_router_that_did_not_reload(self):
+        self.reload = b'{"ok": false, "error": "bad config"}'
+        with self.assertRaises(api.HTTPException) as cm:
+            api.repoint_role("hermes/compressor", "other")
+        self.assertIn("bad config", cm.exception.detail)
 
 
 if __name__ == "__main__":
