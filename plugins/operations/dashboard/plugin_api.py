@@ -2242,15 +2242,45 @@ def fix_alert(key: str = Body(..., embed=True), title: str = Body(..., embed=Tru
 
 
 _LMSTUDIO_URL = os.environ.get("LMSTUDIO_URL", "http://127.0.0.1:1234").rstrip("/")
-_ROUTER_CONFIG = get_default_hermes_root() / "model-router" / "router-config.json"
+_ROLECTL_MCP = get_default_hermes_root() / "bin" / "rolectl-mcp.py"
+
+
+def _role_agents() -> Dict[str, str]:
+    """Each profile whose agents can change router roles, with its default model: it has rolectl-mcp
+    under mcp_servers with ROLECTL_MCP_ALLOW_WRITE=1, rolectl's moderation gate for its write tools."""
+    out = {}
+    for p in kanban_db.list_profiles_on_disk():
+        try:
+            cfg = safe_load(_profile_config(p).read_text(encoding="utf-8")) or {}
+            servers = cfg.get("mcp_servers") or {}
+            model = cfg.get("model")
+        except (OSError, YAMLError, AttributeError):
+            continue
+        if any(isinstance(v, dict) and "rolectl-mcp" in " ".join(map(str, [v.get("command", ""), *(v.get("args") or [])]))
+               and str((v.get("env") or {}).get("ROLECTL_MCP_ALLOW_WRITE")) == "1" for v in servers.values()):
+            out[p] = str((model.get("default") if isinstance(model, dict) else model) or "")
+    return out
+
+
+@router.get("/models/agents")
+def model_agents() -> Dict[str, Any]:
+    """For the once-a-day note that the plugin can do more: whether a model router answers, which
+    profiles can change its roles, and where rolectl-mcp is for the config lines that turn one on."""
+    try:
+        _router("/router/status")
+        up = True
+    except (urllib.error.URLError, OSError, ValueError):
+        up = False
+    return {"router": up, "profiles": _role_agents(),
+            "rolectl_mcp": str(_ROLECTL_MCP) if _ROLECTL_MCP.is_file() else "",
+            "profile": "default" if get_hermes_home() == get_default_hermes_root() else get_hermes_home().name}
 
 
 @router.get("/models/role")
 def model_role(name: str = Query(..., min_length=1)) -> Dict[str, Any]:
-    """Three ways to bring back a router role with no loaded model, each with why it is off when it is:
-    load a candidate in LM Studio, point the role at a model already loaded with the context it needs,
-    or hand it to an agent whose profile has the router's role tools with writes on (rolectl-mcp with
-    ROLECTL_MCP_ALLOW_WRITE=1, its moderation gate)."""
+    """What an agent needs to bring back a router role with no loaded model: the candidates LM Studio
+    could load, the loaded models with the context it needs, and the profiles whose agents can change
+    roles (see _role_agents). Only reads; the agent makes the change, under Hermes's approvals."""
     try:
         snap = _router("/router/status")
     except (urllib.error.URLError, OSError, ValueError) as exc:
@@ -2274,72 +2304,13 @@ def model_role(name: str = Query(..., min_length=1)) -> Dict[str, Any]:
                                                       "Start it in LM Studio or with: lms server start"}
     loaded = sorted(m for m, ctx in (snap.get("loaded") or {}).items()
                     if (ctx or 0) >= need and not any(c["model"] == m and c["live"] for c in cands))
-    agents = []
-    for p in kanban_db.list_profiles_on_disk():
-        try:
-            servers = (safe_load(_profile_config(p).read_text(encoding="utf-8")) or {}).get("mcp_servers") or {}
-        except (OSError, YAMLError, AttributeError):
-            continue
-        if any(isinstance(v, dict) and "rolectl-mcp" in " ".join(map(str, [v.get("command", ""), *(v.get("args") or [])]))
-               and str((v.get("env") or {}).get("ROLECTL_MCP_ALLOW_WRITE")) == "1" for v in servers.values()):
-            agents.append(p)
+    agents = _role_agents()
     return {"role": name, "min_context": need, "candidates": cands, "lmstudio": lmstudio,
             "repoint": {"on": bool(loaded), "models": loaded,
                         "note": "" if loaded else f"No loaded model has the {need} tokens of context this role needs."},
-            "agent": {"on": bool(agents), "profiles": agents,
+            "agent": {"on": bool(agents), "profiles": list(agents), "models": agents,
                       "note": "" if agents else "No profile can change router roles. Turn it on by adding rolectl-mcp under "
                                                 "mcp_servers in a profile's config.yaml with env ROLECTL_MCP_ALLOW_WRITE: \"1\"."}}
-
-
-@router.post("/models/load")
-def load_model(role: str = Body(..., embed=True), model: str = Body(..., embed=True)) -> Dict[str, Any]:
-    """Load one of the role's candidates in LM Studio, with the context the role needs so the router
-    takes it (LM Studio's default context is smaller, and the router skips a model loaded with too little)."""
-    st = model_role(role)
-    if model not in st["lmstudio"]["models"]:
-        raise HTTPException(400, f"{model} is not a candidate of {role} that LM Studio can load")
-    payload = {"model": model, "echo_load_config": True, **({"context_length": st["min_context"]} if st["min_context"] else {})}
-    req = urllib.request.Request(f"{_LMSTUDIO_URL}/api/v1/models/load", data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json"}, method="POST")
-    try:
-        # a large model takes minutes to load
-        with urllib.request.urlopen(req, timeout=600) as resp:
-            out = json.loads(resp.read())
-    except urllib.error.HTTPError as exc:
-        raise HTTPException(502, f"LM Studio refused to load {model}: {exc.read().decode(errors='replace')[:500]}")
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        raise HTTPException(502, f"LM Studio did not finish loading {model}: {exc}")
-    return {"ok": True, "model": model, "context_length": (out.get("load_config") or {}).get("context_length")}
-
-
-@router.post("/models/repoint")
-def repoint_role(role: str = Body(..., embed=True), model: str = Body(..., embed=True)) -> Dict[str, Any]:
-    """Put a loaded model first among the role's candidates in the router's config, and reload the
-    router. The old config is kept beside it, as rolectl keeps it."""
-    if model not in model_role(role)["repoint"]["models"]:
-        raise HTTPException(400, f"{model} is not loaded with the context {role} needs")
-    try:
-        cfg = json.loads(_ROUTER_CONFIG.read_text(encoding="utf-8"))
-        cands = cfg["roles"][role]["candidates"]
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        raise HTTPException(409, f"{_ROUTER_CONFIG} has no role {role} to change: {exc}")
-    cfg["roles"][role]["candidates"] = ([c for c in cands if c.get("model") == model] or [{"model": model}]) \
-        + [c for c in cands if c.get("model") != model]
-    backup = _ROUTER_CONFIG.with_name(f"{_ROUTER_CONFIG.name}.bak.{time.strftime('%Y%m%d-%H%M%S')}")
-    backup.write_bytes(_ROUTER_CONFIG.read_bytes())
-    tmp = _ROUTER_CONFIG.with_name(f".{_ROUTER_CONFIG.name}.tmp")
-    tmp.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, _ROUTER_CONFIG)
-    try:
-        out = _router("/router/reload", {})
-    except urllib.error.HTTPError as exc:
-        out = {"error": exc.read().decode(errors="replace")[:500]}
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        out = {"error": str(exc)}
-    if not out.get("ok"):
-        raise HTTPException(502, f"the config now puts {model} first for {role} (old one: {backup.name}), "
-                                 f"but the router did not reload it: {out.get('error')}")
-    return {"ok": True, "role": role, "model": model, "backup": str(backup)}
 
 
 _RULE_ID = re.compile(r"[a-z0-9][a-z0-9-]*")

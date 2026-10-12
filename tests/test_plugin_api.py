@@ -202,29 +202,24 @@ class ModelActionsTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
-        self.config = root / "router-config.json"
-        self.config.write_text(json.dumps({"roles": {"hermes/compressor": {
-            "candidates": [{"model": "small"}, {"model": "big", "note": "kept"}], "min_context": 64000}}}))
-        (root / "writer.yaml").write_text("mcp_servers:\n  roles:\n    command: python3\n    args: [/x/rolectl-mcp.py]\n"
+        (root / "writer.yaml").write_text("model: {default: hermes/main}\nmcp_servers:\n  roles:\n    command: python3\n    args: [/x/rolectl-mcp.py]\n"
                                           "    env: {ROLECTL_MCP_ALLOW_WRITE: '1'}\n")
         (root / "reader.yaml").write_text("mcp_servers:\n  roles: {command: /x/rolectl-mcp.py}\n")
-        self.calls, self.lmstudio_up, self.reload = [], True, b'{"ok": true}'
+        self.calls, self.lmstudio_up, self.router_up = [], True, True
 
         def fake_urlopen(req, timeout):
             url = req if isinstance(req, str) else req.full_url
             body = None if isinstance(req, str) or req.data is None else json.loads(req.data)
             self.calls.append((url, body))
             if url.endswith("/router/status"):
+                if not self.router_up:
+                    raise urllib.error.URLError("connection refused")
                 return io.BytesIO(json.dumps(ROUTER_STATUS).encode())
-            if url.endswith("/router/reload"):
-                return io.BytesIO(self.reload)
             if not self.lmstudio_up:
                 raise urllib.error.URLError("connection refused")
-            if url.endswith("/api/v1/models"):
-                return io.BytesIO(json.dumps(LMSTUDIO).encode())
-            return io.BytesIO(json.dumps({"load_config": {"context_length": body["context_length"]}}).encode())
+            return io.BytesIO(json.dumps(LMSTUDIO).encode())
         for p in (mock.patch.object(api.urllib.request, "urlopen", fake_urlopen),
-                  mock.patch.object(api, "_ROUTER_CONFIG", self.config),
+                  mock.patch.object(api, "_ROLECTL_MCP", root / "rolectl-mcp.py"),
                   mock.patch.object(api, "_profile_config", lambda p: root / f"{p}.yaml"),
                   mock.patch.object(api.kanban_db, "list_profiles_on_disk", lambda: ["default", "reader", "writer"]),
                   mock.patch.dict(api.os.environ, {"MODEL_ROUTER_TOKEN": "t"})):
@@ -238,6 +233,7 @@ class ModelActionsTest(unittest.TestCase):
         self.assertEqual(st["lmstudio"], {"on": True, "models": ["small"], "note": ""})
         self.assertEqual(st["repoint"]["models"], ["other"])
         self.assertEqual(st["agent"]["profiles"], ["writer"])
+        self.assertEqual(st["agent"]["models"], {"writer": "hermes/main"})
 
     def test_off_ways_say_why(self):
         self.lmstudio_up = False
@@ -251,35 +247,20 @@ class ModelActionsTest(unittest.TestCase):
             api.model_role("no/such-role")
         self.assertEqual(cm.exception.status_code, 404)
 
-    def test_load_asks_lm_studio_for_the_context_the_role_needs(self):
-        out = api.load_model("hermes/compressor", "small")
-        self.assertEqual((out["model"], out["context_length"]), ("small", 64000))
-        self.assertEqual(self.calls[-1], ("http://127.0.0.1:1234/api/v1/models/load",
-                                          {"model": "small", "echo_load_config": True, "context_length": 64000}))
-        with self.assertRaises(api.HTTPException) as cm:
-            api.load_model("hermes/compressor", "other")
-        self.assertEqual(cm.exception.status_code, 400)
+    def test_agents_says_whether_the_plugin_can_do_more(self):
+        out = api.model_agents()
+        self.assertEqual((out["router"], out["profiles"], out["rolectl_mcp"]), (True, {"writer": "hermes/main"}, ""))
+        (Path(self.tmp.name) / "rolectl-mcp.py").write_text("")
+        self.router_up = False
+        out = api.model_agents()
+        self.assertFalse(out["router"])
+        self.assertTrue(out["rolectl_mcp"].endswith("rolectl-mcp.py"))
 
-    def test_repoint_puts_the_model_first_backs_up_and_reloads(self):
-        before = self.config.read_text()
-        api.repoint_role("hermes/compressor", "other")
-        cands = json.loads(self.config.read_text())["roles"]["hermes/compressor"]["candidates"]
-        self.assertEqual(cands, [{"model": "other"}, {"model": "small"}, {"model": "big", "note": "kept"}])
-        backups = list(self.config.parent.glob("router-config.json.bak.*"))
-        self.assertEqual([b.read_text() for b in backups], [before])
-        self.assertTrue(self.calls[-1][0].endswith("/router/reload"))
-
-    def test_repoint_refuses_a_model_without_the_context(self):
-        before = self.config.read_text()
-        with self.assertRaises(api.HTTPException):
-            api.repoint_role("hermes/compressor", "tiny")
-        self.assertEqual(self.config.read_text(), before)
-
-    def test_repoint_reports_a_router_that_did_not_reload(self):
-        self.reload = b'{"ok": false, "error": "bad config"}'
-        with self.assertRaises(api.HTTPException) as cm:
-            api.repoint_role("hermes/compressor", "other")
-        self.assertIn("bad config", cm.exception.detail)
+    def test_nothing_writes_to_lm_studio_or_the_router(self):
+        api.model_role("hermes/compressor")
+        api.model_agents()
+        self.assertTrue(all(body is None for _, body in self.calls))
+        self.assertFalse(any("/models/" in r.path and "GET" not in r.methods for r in api.router.routes))
 
 
 if __name__ == "__main__":

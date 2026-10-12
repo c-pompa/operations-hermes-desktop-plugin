@@ -44,9 +44,9 @@
  *   GET /attention        -> { items: the attention list alone, errors } (the alert poll)
  *   GET /assignees        -> { assignees: profile names }
  *   POST /attention/fix {key, title, body, profile} -> a kanban card for one alert, started now: { ok, card, existing, status, started, warning }
- *   GET /models/role?name= -> { role, min_context, candidates, lmstudio, repoint, agent } (each way: { on, models | profiles, note })
- *   POST /models/load {role, model}    -> loads a candidate in LM Studio with the role's context: { ok, model, context_length }
- *   POST /models/repoint {role, model} -> puts a loaded model first for the role and reloads the router: { ok, backup }
+ *   GET /models/role?name= -> { role, min_context, candidates, lmstudio, repoint, agent } (read-only: what an
+ *                             agent needs to bring the role back; agent also carries profiles and their models)
+ *   GET /models/agents    -> { router, profiles: {name: default model}, rolectl_mcp, profile } (the once-a-day toast)
  *   POST /cards/{id}/assign {profile, start_at?} -> { ok, status, started, warning, starts_at? }
  *   POST /cards/{id}/unblock {comment}       -> { ok, status, started, warning }
  *   POST /cards/{id}/close {outcome, result} -> { ok, status }
@@ -633,63 +633,106 @@ function TodayStrip({ hours, changes = [], incidents = [] }) {
   })
 }
 
-// A router role with no loaded model, three ways back: load a candidate in LM Studio, point the role at a
-// model already loaded, or hand it to an agent whose profile can change roles. A way that cannot work
-// now is greyed, with what turns it on.
+// A new chat (in profile, or the current one) with text written into its composer, for the user to
+// read and send. The composer mounts after the route changes; ask until it answers.
+async function openChat(profile, text) {
+  host.newChat(profile || null)
+  for (let i = 0; i < 20; i++) {
+    await new Promise(r => setTimeout(r, 250))
+    if (await host.composer.setDraft(null, text).catch(() => false)) return true
+  }
+  return false
+}
+const canChat = () => !!(host.newChat && host.composer?.setDraft)
+
+// What an agent is told about a router role with no loaded model.
+const roleBrief = (role, d, tail) => [
+  `The model router role ${role} has no loaded model it can use, so whatever calls it fails.`,
+  `It needs ${d.min_context} tokens of context. Candidates, in order: ${d.candidates.map(c => c.model).join(', ') || 'none'}.`,
+  d.lmstudio.models.length ? `Candidates LM Studio could load: ${d.lmstudio.models.join(', ')}.` : d.lmstudio.note,
+  d.repoint.models.length ? `Loaded models with enough context: ${d.repoint.models.join(', ')}.` : d.repoint.note, '',
+  `Bring it back one of two ways: load a candidate with the context it needs (lms load <model>${d.min_context ? ` --context-length ${d.min_context}` : ''}), or put a loaded model that fits first among the role's candidates with the rolectl role tools, keeping the others after it. Then check the role resolves with role_test. ${tail}`
+].join('\n')
+
+// What a chat is told to turn on rolectl-mcp, with its writes, for one profile (a from /models/agents).
+const rolectlBrief = a => [
+  "Hermes Operations: no profile can change the model router's roles, so a role left with no loaded model has to be fixed by hand.",
+  a.rolectl_mcp ? '' : 'rolectl-mcp.py, which the model router installs, is not in ~/.hermes/bin. Find it on this machine first; if it is not here, stop and say so.',
+  `Turn it on for the ${a.profile} profile: in its config.yaml, add this under mcp_servers. Keep a copy of the file first and change nothing else.`, '',
+  '  rolectl:', '    command: python3', `    args: [${a.rolectl_mcp || '<path to rolectl-mcp.py>'}]`, '    env:', '      ROLECTL_MCP_ALLOW_WRITE: "1"', '',
+  'Then tell me what loads it (a new session or a gateway restart). If a step needs me, stop and say what.'
+].filter(Boolean).join('\n')
+
+const fixRolectl = async a => {
+  if (!await openChat(a.profile, rolectlBrief(a))) host.notify({ kind: 'error', title: 'Operations', message: 'The new chat did not take the change. Copy it from a model role on Overview instead.' })
+}
+
+// No profile can change router roles: the config lines that turn it on for this profile, in a chat
+// that adds them (read and sent by the user, its edit under Hermes's approvals) or copied.
+function RolectlFix({ note }) {
+  const { data } = useQuery({ queryKey: [ID, 'models-agents'], queryFn: () => api.rest('/models/agents') })
+  const [msg, setMsg] = useState(null)
+  return jsxs('div', { className: 'grid gap-1', children: [
+    muted(note),
+    data ? jsxs('div', { className: 'flex flex-wrap items-center gap-2', children: [
+      canChat() ? jsx(Button, { size: 'xs', variant: 'ghost', onClick: () => fixRolectl(data), children: `Fix in a chat in ${data.profile}` }) : null,
+      jsx(Button, { size: 'xs', variant: 'ghost', onClick: async () => setMsg(await api.os.writeClipboard(rolectlBrief(data)) ? { text: 'Copied.' } : { bad: true, text: 'Could not copy.' }), children: 'Copy' })
+    ] }) : null,
+    msg ? jsx('div', { style: { fontSize: 13, color: msg.bad ? TONE.bad : undefined }, children: msg.text }) : null
+  ] })
+}
+
+// A router role with no loaded model, handed to an agent whose profile can change roles: a new chat
+// with the role written into its composer (sent by the user, on the profile's default model unless the
+// model pill picks another), or a kanban card started now. The agent's changes go through Hermes's
+// approvals; this plugin only reads LM Studio and the router.
 function ModelActions({ role }) {
   const qc = useQueryClient()
   const { data, error, isLoading } = useQuery({ queryKey: [ID, 'models-role', role], queryFn: () => api.rest(`/models/role?name=${encodeURIComponent(role)}`) })
-  const [pick, setPick] = useState({})
-  const [busy, setBusy] = useState(null)
+  const [pick, setPick] = useState('')
+  const [busy, setBusy] = useState(false)
   const [note, setNote] = useState(null)
   if (isLoading) return jsx(Skeleton, { className: 'h-24' })
   if (error) return muted(error.message || String(error))
-  const run = async (way, choice) => {
-    setBusy(way)
+  if (!data.agent.on) return jsx(RolectlFix, { note: data.agent.note })
+  const profile = pick || data.agent.profiles[0]
+  const model = data.agent.models[profile]
+  const chat = async () => {
+    setBusy(true)
     setNote(null)
     try {
-      if (way === 'load') {
-        const out = await api.rest('/models/load', { method: 'POST', body: { role, model: choice } })
-        setNote({ text: `Loaded ${choice} with ${out.context_length || data.min_context} tokens of context; the router takes it on its next check.` })
-      } else if (way === 'repoint') {
-        await api.rest('/models/repoint', { method: 'POST', body: { role, model: choice } })
-        setNote({ text: `${role} now tries ${choice} first. The old router config is kept beside it.` })
-      } else {
-        const out = await api.rest('/attention/fix', { method: 'POST', body: {
-          key: `model-role:${role}`, title: `Get a loaded model for router role ${role}`, profile: choice,
-          body: [`The model router role ${role} has no loaded model it can use, so whatever calls it fails.`,
-                 `Candidates, in order: ${data.candidates.map(c => c.model).join(', ') || 'none'}. It needs ${data.min_context} tokens of context.`, '',
-                 'Use the router role tools (rolectl) to load a candidate or point the role at a loaded model that fits, then check the role resolves. If a step needs a person, block this card and say what.'].join('\n') } })
-        setNote({ bad: !!out.warning, card: out.card, text: out.existing ? `Card ${out.card} for this role is already open (${out.status}).` : out.warning || `Card ${out.card} filed for ${choice} (${out.status}).` })
-      }
+      if (!await openChat(profile, roleBrief(role, data, 'If a step needs me, stop and say what.'))) setNote({ bad: true, text: 'The new chat did not take the role. Use Copy instead.' })
+    } finally {
+      setBusy(false)
+    }
+  }
+  const card = async () => {
+    setBusy(true)
+    setNote(null)
+    try {
+      const out = await api.rest('/attention/fix', { method: 'POST', body: {
+        key: `model-role:${role}`, title: `Get a loaded model for router role ${role}`, profile,
+        body: roleBrief(role, data, 'If a step needs a person, block this card and say what.') } })
+      setNote({ bad: !!out.warning, card: out.card, text: out.existing ? `Card ${out.card} for this role is already open (${out.status}).` : out.warning || `Card ${out.card} filed for ${profile} (${out.status}).` })
       qc.invalidateQueries({ queryKey: [ID] })
     } catch (e) {
       setNote({ bad: true, text: e?.message || String(e) })
     }
-    setBusy(null)
+    setBusy(false)
   }
-  const ways = [
-    ['load', 'Load in LM Studio', data.lmstudio, data.lmstudio.models],
-    ['repoint', 'Use this loaded model', data.repoint, data.repoint.models],
-    ['agent', 'Ask a Hermes agent', data.agent, data.agent.profiles]
-  ]
   return jsxs('div', {
-    className: 'grid gap-3',
+    className: 'grid gap-1',
     children: [
-      ...ways.map(([way, label, state, options]) => {
-        const choice = pick[way] || options[0] || ''
-        return jsxs('div', { key: way, className: 'grid gap-1', children: [
-          jsxs('div', { className: 'flex flex-wrap items-center gap-2', children: [
-            jsxs(Select, { value: choice, onValueChange: v => setPick({ ...pick, [way]: v }), disabled: !state.on || !!busy, children: [
-              jsx(SelectTrigger, { className: 'h-7 w-56 text-xs', children: jsx(SelectValue, { placeholder: way === 'agent' ? 'No profile can' : 'No model' }) }),
-              jsx(SelectContent, { children: options.map(o => jsx(SelectItem, { key: o, value: o, children: o })) })
-            ] }),
-            jsx(Button, { size: 'xs', variant: 'ghost', disabled: !state.on || !choice || !!busy, onClick: () => run(way, choice),
-                          children: busy === way ? (way === 'load' ? 'Loading, this can take minutes' : 'Working') : label })
-          ] }),
-          state.on ? null : muted(state.note)
-        ] })
-      }),
+      jsxs('div', { className: 'flex flex-wrap items-center gap-2', children: [
+        jsxs(Select, { value: profile, onValueChange: setPick, disabled: busy, children: [
+          jsx(SelectTrigger, { className: 'h-7 w-56 text-xs', children: jsx(SelectValue, {}) }),
+          jsx(SelectContent, { children: data.agent.profiles.map(p => jsx(SelectItem, { key: p, value: p, children: p })) })
+        ] }),
+        canChat() ? jsx(Button, { size: 'xs', variant: 'ghost', disabled: busy, onClick: chat, children: `Open a chat in ${profile}` }) : null,
+        jsx(Button, { size: 'xs', variant: 'ghost', disabled: busy, onClick: card, children: `Hand to ${profile} on kanban` }),
+        jsx(Button, { size: 'xs', variant: 'ghost', onClick: async () => setNote(await api.os.writeClipboard(roleBrief(role, data, '')) ? { text: 'Copied.' } : { bad: true, text: 'Could not copy.' }), children: 'Copy' })
+      ] }),
+      muted(`The chat starts on ${profile}'s default model${model ? `, ${model}` : ''}; pick another with the model pill before sending.`),
       note ? jsxs('div', { key: 'note', className: 'flex flex-wrap items-center gap-2', style: { fontSize: 13, color: note.bad ? TONE.bad : undefined }, children: [
         note.text, note.card && !note.bad ? jsx(GoLink, { tab: 'handoffs', sel: note.card, children: 'Open the card in Handoffs' }) : null
       ] }) : null
@@ -4965,6 +5008,27 @@ function setupToast(ctx) {
   })
 }
 
+// Once a day, while a model router answers and no profile can change its roles: a toast saying the
+// plugin can do more, with a chat that turns rolectl-mcp on for this profile.
+const ROLECTL_TOASTED = 'rolectl.toasted'
+
+function rolectlToast(ctx) {
+  const check = () => {
+    const today = new Date().toDateString()
+    if (ctx.storage.get(ROLECTL_TOASTED, '') === today) return
+    ctx.rest('/models/agents').then(a => {
+      ctx.storage.set(ROLECTL_TOASTED, today)
+      if (!a.router || Object.keys(a.profiles).length) return
+      host.notify({ kind: 'info', title: 'Operations can do more', message: 'No profile can fix model router roles.',
+                    detail: 'With rolectl-mcp on and its writes allowed, a chat or a kanban card can bring back a role that has no loaded model.',
+                    action: canChat() ? { label: 'Fix in a chat', onClick: () => fixRolectl(a) } : { label: 'Open Operations', onClick: () => host.navigate(PATH) } })
+    }, () => {})
+  }
+  check()
+  const timer = setInterval(check, 3600_000)
+  ctx.onDispose(() => clearInterval(timer))
+}
+
 function SetupChecklist() {
   const { data } = useSetup()
   const [hidden, setHidden] = useState(() => { try { return api.storage.get(SETUP_HIDDEN, false) } catch { return false } })
@@ -5308,14 +5372,8 @@ function AlertActions({ a }) {
   const chat = async () => {
     setBusy(true)
     setNote(null)
-    host.newChat(profile || null)
-    // the new chat's composer mounts after the route changes; ask until it answers
     try {
-      for (let i = 0; i < 20; i++) {
-        await new Promise(r => setTimeout(r, 250))
-        if (await host.composer.setDraft(null, alertBrief(a, 'If a step needs me, stop and say what.', session)).catch(() => false)) return
-      }
-      host.notify({ kind: 'error', title: 'Operations', message: 'The new chat did not take the alert. Copy it from the Notifications tab instead.' })
+      if (!await openChat(profile, alertBrief(a, 'If a step needs me, stop and say what.', session))) host.notify({ kind: 'error', title: 'Operations', message: 'The new chat did not take the alert. Copy it from the Notifications tab instead.' })
     } finally {
       setBusy(false)
     }
@@ -5343,7 +5401,7 @@ function AlertActions({ a }) {
           jsx(SelectTrigger, { className: 'h-7 w-48 text-xs', children: jsx(SelectValue, { placeholder: 'Pick a profile' }) }),
           jsx(SelectContent, { children: (data?.assignees || []).map(p => jsx(SelectItem, { key: p, value: p, children: p })) })
         ] }),
-        host.newChat && host.composer?.setDraft
+        canChat()
           ? jsx(Button, { size: 'xs', variant: 'ghost', disabled: busy, onClick: chat, children: profile ? `Open a chat in ${profile} to fix` : 'Open a chat to fix' })
           : null,
         !setup || setup.kanban
@@ -5616,6 +5674,7 @@ export default {
     api = ctx
     startAlerts(ctx)
     setupToast(ctx)
+    rolectlToast(ctx)
     ctx.register({
       id: 'page',
       area: ROUTES_AREA,
