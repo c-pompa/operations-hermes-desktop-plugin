@@ -105,8 +105,8 @@ Or in Hermes Desktop: Capabilities > Plugins > Install from Git, with the same U
   first candidate still loaded, or with none, a strict role stops and any other falls through to
   its last candidate.
 - The router is found the way its own plugin finds it: `MODEL_ROUTER_URL` (else its default
-  address) with `MODEL_ROUTER_TOKEN` / `ROUTER_TOKEN` or `<hermes root>/model-router/router.token`.
-  Without one, the page says so and shows observed traffic only.
+  address), with the Model router token setting (or `MODEL_ROUTER_TOKEN`) when the router asks
+  for a bearer token. Without one, the page says so and shows observed traffic only.
 
 **Chips and sheets**
 
@@ -330,6 +330,7 @@ All optional, in Capabilities > Plugins > Operations (the gear), stored under
 | Conformance project | `conformance_project` | empty | `group/repo` or a local `conformance.yaml` path; adds a fleet standard. Empty uses `~/.hermes/conformance/conformance.yaml` if it exists |
 | GitLab host | `gitlab_host` | empty | your GitLab server, such as `gitlab.com` (or `GITLAB_HOST`) |
 | GitLab token | `gitlab_token` | empty | `read_api` to read; `api` to propose a rule (or `GITLAB_TOKEN`) |
+| Model router token | `model_router_token` | empty | bearer token for the router's status endpoint, if it asks for one (or `MODEL_ROUTER_TOKEN`) |
 | Activity summaries | `activity_summaries` | off | model-written Activity sentences |
 | Discord alerts | `alert_target` | empty | `discord`, `discord:<channel>`, or any `hermes send` target |
 | When a host drifts | `drift_action` | `button` | `button` offers a fix card or "I'll run it"; `automatic` files and starts the card for `drift_profile` at most once a day per host; `off` shows the checks only |

@@ -480,13 +480,14 @@ def _settings() -> Dict[str, Any]:
 
 
 def _gitlab_host() -> str:
-    """GITLAB_HOST, else the gitlab_host setting."""
-    return os.environ.get("GITLAB_HOST") or _settings().get("gitlab_host") or ""
+    """GITLAB_HOST, else the gitlab_host setting; env reads go through get_secret so the active
+    profile's values are used when one Hermes process serves several profiles."""
+    return get_secret("GITLAB_HOST") or _settings().get("gitlab_host") or ""
 
 
 def _gitlab_token() -> str:
-    """The gitlab_token setting, else GITLAB_TOKEN."""
-    return get_secret("OPERATIONS_GITLAB_TOKEN") or os.environ.get("GITLAB_TOKEN", "")
+    """The gitlab_token setting, else GITLAB_TOKEN (same profile scoping as _gitlab_host)."""
+    return get_secret("OPERATIONS_GITLAB_TOKEN") or get_secret("GITLAB_TOKEN") or ""
 
 
 def _gitlab(path: str, body: Optional[Dict[str, Any]] = None) -> str:
@@ -1043,6 +1044,7 @@ def trace_session(session_id: str) -> Dict[str, Any]:
         out["errors"]["trace"] = str(exc)
     finally:
         m.close()
+    out["summaries"] = _settings().get("activity_summaries") is True
     return out
 
 
@@ -1057,7 +1059,10 @@ _EXPLAIN_PROMPT = (
 @router.post("/trace/{session_id}/explain")
 def trace_explain(session_id: str) -> Dict[str, Any]:
     """A plain-language reading of a session's trace, written on request by the model set for the
-    "operations_summary" auxiliary task from the facts the Trace page shows. Nothing is cached or written."""
+    "operations_summary" auxiliary task from the facts the Trace page shows. Nothing is cached or written.
+    Gated on the activity_summaries setting, which says the plugin calls no model while it is off."""
+    if _settings().get("activity_summaries") is not True:
+        raise HTTPException(403, "Activity summaries are off: turn on activity_summaries in the plugin's settings.")
     t = trace_session(session_id)
     if t["errors"].get("metrics") or t["errors"].get("trace") or not t.get("calls"):
         raise HTTPException(404, "No model calls recorded for this session.")
@@ -1276,15 +1281,10 @@ def _router_url() -> str:
 
 
 def _router(path: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """One call to the model router, found the way the router's own plugin finds it: MODEL_ROUTER_URL
-    (the router's default address otherwise), and MODEL_ROUTER_TOKEN / ROUTER_TOKEN or
-    <hermes root>/model-router/router.token. Raises what urlopen raises when it does not answer."""
-    tok = os.environ.get("MODEL_ROUTER_TOKEN") or os.environ.get("ROUTER_TOKEN") or ""
-    if not tok:
-        try:
-            tok = (get_default_hermes_root() / "model-router" / "router.token").read_text(encoding="utf-8").strip()
-        except OSError:
-            pass
+    """One call to the model router: MODEL_ROUTER_URL (the router's default address otherwise),
+    with the model_router_token setting / MODEL_ROUTER_TOKEN if the router asks for a bearer
+    token. Raises what urlopen raises when it does not answer."""
+    tok = get_secret("MODEL_ROUTER_TOKEN") or ""
     headers = {"Authorization": f"Bearer {tok}"} if tok else {}
     if payload is not None:
         headers["Content-Type"] = "application/json"

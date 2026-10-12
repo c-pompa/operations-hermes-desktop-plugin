@@ -101,25 +101,26 @@ class ChangesTest(unittest.TestCase):
 
 class GitLabLoginTest(unittest.TestCase):
     def test_reads_only_its_own_settings_and_env(self):
-        saved = ({k: api.os.environ.pop(k, None) for k in ("GITLAB_HOST", "GITLAB_TOKEN")}, api._settings, api.get_secret)
-        api._settings, api.get_secret = dict, (lambda name: None)
+        saved = (api._settings, api.get_secret)
+        api._settings, api.get_secret = dict, (lambda name, default=None: default)
         try:
             # nothing configured: no login, whatever other tools have stored
             self.assertEqual((api._gitlab_host(), api._gitlab_token()), ("", ""))
-            api.os.environ.update(GITLAB_HOST="gitlab.example.com", GITLAB_TOKEN="from-env")
+            # env fallbacks, read profile-scoped through get_secret
+            api.get_secret = lambda name, default=None: {"GITLAB_HOST": "gitlab.example.com",
+                                                         "GITLAB_TOKEN": "from-env"}.get(name, default)
             self.assertEqual((api._gitlab_host(), api._gitlab_token()), ("gitlab.example.com", "from-env"))
             # the plugin's own token setting wins over GITLAB_TOKEN
-            api.get_secret = lambda name: "from-settings" if name == "OPERATIONS_GITLAB_TOKEN" else None
+            api.get_secret = lambda name, default=None: {"GITLAB_HOST": "gitlab.example.com",
+                                                         "GITLAB_TOKEN": "from-env",
+                                                         "OPERATIONS_GITLAB_TOKEN": "from-settings"}.get(name, default)
             self.assertEqual(api._gitlab_token(), "from-settings")
-            del api.os.environ["GITLAB_HOST"]
+            # and the gitlab_host setting applies when GITLAB_HOST is unset
+            api.get_secret = lambda name, default=None: default
             api._settings = lambda: {"gitlab_host": "gitlab.other.example"}
             self.assertEqual(api._gitlab_host(), "gitlab.other.example")
         finally:
-            for k, v in saved[0].items():
-                api.os.environ.pop(k, None)
-                if v is not None:
-                    api.os.environ[k] = v
-            api._settings, api.get_secret = saved[1], saved[2]
+            api._settings, api.get_secret = saved
 
 
 if __name__ == "__main__":

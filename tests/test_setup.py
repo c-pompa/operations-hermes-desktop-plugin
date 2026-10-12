@@ -92,15 +92,17 @@ class SetupRouteTest(unittest.TestCase):
         self.assertEqual(api.setup()["from_default"], [])
 
 
-def host(name, *statuses, stale=False):
-    return {"host": name, "stale": stale, "results": {f"r{i}": {"status": s} for i, s in enumerate(statuses)}}
+def host(name, *statuses, stale=False, verified=True):
+    return {"host": name, "stale": stale, "verified": verified,
+            "results": {f"r{i}": {"status": s} for i, s in enumerate(statuses)}}
 
 
 class AutomaticDriftTest(unittest.TestCase):
     def test_drift_due(self):
         now = time.time()
         hosts = [host("ok", "pass"), host("bad", "pass", "fail"), host("warn", "warn"),
-                 host("quiet", "fail", stale=True), host("recent", "fail")]
+                 host("quiet", "fail", stale=True), host("recent", "fail"),
+                 host("unverified", "fail", verified=False)]
         self.assertEqual(hook.drift_due(hosts, {"warn": now - 25 * 3600, "recent": now - 3600}, now), ["bad", "warn"])
 
     local = Path("/nonexistent/conformance.yaml")

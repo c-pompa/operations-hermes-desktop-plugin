@@ -105,9 +105,12 @@ DRIFT_RETRY_S = 24 * 3600
 
 
 def drift_due(hosts, last, now):
-    """Hosts whose fresh newest report fails or warns on a check, with no automatic card tried for a day."""
+    """Hosts whose fresh, verified newest report fails or warns on a check, with no automatic card tried
+    for a day. An unverified report (its ingest token could not vouch for the host) stays on the button
+    flow: it must not auto-start a card."""
     return [h["host"] for h in hosts
-            if not h.get("stale") and any(r["status"] in ("fail", "warn") for r in h["results"].values())
+            if h.get("verified", True) and not h.get("stale")
+            and any(r["status"] in ("fail", "warn") for r in h["results"].values())
             and now - (last.get(h["host"]) or 0) >= DRIFT_RETRY_S]
 
 

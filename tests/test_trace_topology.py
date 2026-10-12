@@ -232,6 +232,13 @@ class TraceTopologyTest(unittest.TestCase):
         finally:
             m.close()
 
+    def test_explain_needs_activity_summaries_on(self):
+        self.retried_session()
+        with mock.patch.object(api, "_settings", lambda: {}):
+            with self.assertRaises(HTTPException) as cm:
+                api.trace_explain("r")
+        self.assertEqual(cm.exception.status_code, 403)
+
     def test_explain_sends_the_trace_failed_calls_first(self):
         self.retried_session()
         sent = []
@@ -240,18 +247,19 @@ class TraceTopologyTest(unittest.TestCase):
             sent.append(kw)
             kw["route_info"].update(provider="lmstudio", model="qwen3-4b")
             return SimpleNamespace(model="qwen3-4b", choices=[SimpleNamespace(message=SimpleNamespace(content=" It queued. "))])
-        with mock.patch("agent.auxiliary_client.call_llm", call):
-            out = api.trace_explain("r")
-        self.assertEqual(out, {"text": "It queued.", "model": "qwen3-4b", "provider": "lmstudio", "errors": {}})
-        self.assertEqual(sent[0]["task"], "operations_summary")
-        prompt = sent[0]["messages"][1]["content"]
-        self.assertLess(prompt.index("call 1.1:"), prompt.index("call 1.3:"))
-        self.assertIn("attempt 1 of 3", prompt)
-        self.assertIn("Timed out: no answer within 30m", prompt)
-        with mock.patch("agent.auxiliary_client.call_llm", side_effect=RuntimeError("no provider")):
-            self.assertEqual(api.trace_explain("r"), {"text": None, "errors": {"model": "RuntimeError: no provider"}})
-        with self.assertRaises(HTTPException):
-            api.trace_explain("nothing")
+        with mock.patch.object(api, "_settings", lambda: {"activity_summaries": True}):
+            with mock.patch("agent.auxiliary_client.call_llm", call):
+                out = api.trace_explain("r")
+            self.assertEqual(out, {"text": "It queued.", "model": "qwen3-4b", "provider": "lmstudio", "errors": {}})
+            self.assertEqual(sent[0]["task"], "operations_summary")
+            prompt = sent[0]["messages"][1]["content"]
+            self.assertLess(prompt.index("call 1.1:"), prompt.index("call 1.3:"))
+            self.assertIn("attempt 1 of 3", prompt)
+            self.assertIn("Timed out: no answer within 30m", prompt)
+            with mock.patch("agent.auxiliary_client.call_llm", side_effect=RuntimeError("no provider")):
+                self.assertEqual(api.trace_explain("r"), {"text": None, "errors": {"model": "RuntimeError: no provider"}})
+            with self.assertRaises(HTTPException):
+                api.trace_explain("nothing")
 
     def test_topology_links_gateways_hosts_and_what_served_them(self):
         out = api.topology_route(24)

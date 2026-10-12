@@ -38,8 +38,9 @@
  *   GET /handoffs?hours=N -> { items: cards and subagent delegations, pairs, truncated, errors }
  *   GET /trace?hours=N    -> { sessions, truncated, errors }
  *   GET /find-session?prefix=&before= -> { session: {session_id, start, end} | null, errors } (a health finding's cut-short id)
- *   GET /trace/{session}  -> { calls, subagents, parent, why, platform, profile, truncated, errors }
- *   POST /trace/{session}/explain -> { text, model, provider, errors } (written on request by the summaries model)
+ *   GET /trace/{session}  -> { calls, subagents, parent, why, platform, profile, truncated, summaries, errors }
+ *   POST /trace/{session}/explain -> { text, model, provider, errors } (written on request by the summaries
+ *                             model; needs the activity_summaries setting on, else 403)
  *   GET /topology?hours=N -> { hosts (with drift), gateways, edges (with models), served, timeline (replay), router, errors }
  *   GET /attention        -> { items: the attention list alone, errors } (the alert poll)
  *   GET /assignees        -> { assignees: profile names }
@@ -2279,16 +2280,18 @@ function SessionTrace({ sid, onOpen, drawer, fitH }) {
           ? jsx('p', { key: 't', style: { margin: 0, fontSize: 13.5, lineHeight: 1.6, textWrap: 'pretty' }, children: explained.text })
           : explained?.errors?.model ? drawerText('e', `Could not explain it: ${explained.errors.model}`) : null,
         explained?.text ? jsx('span', { key: 'm', style: { fontSize: 11, color: 'var(--ui-text-quaternary)' }, children: `Written by ${explained.model}${explained.provider ? ` via ${explained.provider}` : ''} from this trace; check it against the calls.` }) : null,
-        jsx('div', { key: 'b', children: btn('x', explained === 'asking' ? 'Explaining...' : explained ? 'Explain again' : 'Explain this session', async () => {
-          if (explained === 'asking') return
-          haptic('tap')
-          setExplained('asking')
-          try {
-            setExplained(await api.rest(`/trace/${encodeURIComponent(sid)}/explain`, { method: 'POST', body: {}, timeoutMs: 120_000 }))
-          } catch (e) {
-            setExplained({ errors: { model: e?.message || 'the backend did not respond' } })
-          }
-        }) })
+        data.summaries
+          ? jsx('div', { key: 'b', children: btn('x', explained === 'asking' ? 'Explaining...' : explained ? 'Explain again' : 'Explain this session', async () => {
+            if (explained === 'asking') return
+            haptic('tap')
+            setExplained('asking')
+            try {
+              setExplained(await api.rest(`/trace/${encodeURIComponent(sid)}/explain`, { method: 'POST', body: {}, timeoutMs: 120_000 }))
+            } catch (e) {
+              setExplained({ errors: { model: e?.message || 'the backend did not respond' } })
+            }
+          }) })
+          : drawerText('b', 'Model-written readings are off. Turning on Activity summaries in the plugin\'s settings lets the model read a session\'s trace on request.')
       ]
     }),
     jsx('p', { key: 'hint', style: { margin: 0, color: DIM }, children: 'Select a call for its details.' })

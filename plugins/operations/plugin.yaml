@@ -42,6 +42,14 @@ config_schema:
     description: >-
       API token; read_api is enough, except proposing a conformance rule, which opens a
       merge request and needs api. Leave empty to use GITLAB_TOKEN.
+  model_router_token:
+    type: secret
+    env: MODEL_ROUTER_TOKEN
+    label: Model router token
+    description: >-
+      Bearer token for the model router's status endpoint, if the router asks for one; used by
+      Topology's router roles and the model-role incidents on Overview. Leave empty when the
+      router has no token.
   activity_summaries:
     type: bool
     default: false
