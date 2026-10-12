@@ -73,12 +73,12 @@ Or in Hermes Desktop: Capabilities > Plugins > Install from Git, with the same U
   in Trace and to its profile on the map over the session (its last hour if it ran longer).
   Incidents and each group of failed calls have **Fix this**, as on a Needs attention card: a new
   chat or a kanban card for a profile, with what failed, where, its sessions and how to check.
-  An incident about a model router role with no loaded model also offers three ways to bring it
-  back: load a candidate in LM Studio (with the context the role needs), put a model that is
-  already loaded first for the role (the router config is backed up and the router reloaded), or
-  file a card for a Hermes agent. Each is greyed with a note when it cannot work: LM Studio's
-  server not answering or no candidate to load, no loaded model with enough context, or no profile
-  with `rolectl-mcp` under `mcp_servers` and `ROLECTL_MCP_ALLOW_WRITE: "1"`.
+  An incident about a model router role with no loaded model is handed to an agent, not fixed by
+  the plugin: a new chat on a profile whose config has `rolectl-mcp` under `mcp_servers` with
+  `ROLECTL_MCP_ALLOW_WRITE: "1"` (on the profile's default model, changeable with the model pill),
+  or a kanban card for that profile — with the role's candidates, the context it needs and how to
+  check, any change under Hermes's approvals. When no profile qualifies, a once-a-day toast and
+  the role drawer offer a chat that adds rolectl-mcp to this profile's config, or the lines to copy.
 - **Errors in an hour** are grouped by what failed and where (error text, entry point and host,
   profile, model, what served it), each linking to its newest failing session in Trace, its
   model in Flow and the map over that hour.
