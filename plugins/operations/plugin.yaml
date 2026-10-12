@@ -1,6 +1,7 @@
 name: operations
 version: 0.1.0
 manifest_version: 2
+requires_hermes: ">=0.21.5"
 description: >-
   Operations page: vitals, today, what needs attention, changes and news,
   hosts and model pool, request flow, activity, kanban and subagent handoffs

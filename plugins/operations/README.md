@@ -355,6 +355,12 @@ All optional, in Capabilities > Plugins > Operations (the gear), stored under
 | the kanban board | cards, runs and handoffs |
 | GitLab | merge requests, pipelines, the fleet standard |
 | `<hermes root>/plugin-data/gitlab-mr/device-aliases.json` | pairing hosts with pool devices |
+| profile `config.yaml` files | where the plugin is enabled, and which profiles can change router roles (`rolectl-mcp` with writes on) |
+| the model router's status endpoint | router roles: which models are loaded and with how much context |
+| LM Studio's local server (`LMSTUDIO_URL`, default `http://127.0.0.1:1234`) | which of a role's candidates it could load |
+
+Shell commands are only `git status`, `git rev-parse` and `git ls-files` in checked project folders
+(conformance); nothing else runs.
 
 A missing source shows as "unavailable" or "not set up" in its own section. If the metrics
 database or kanban board does not exist yet, the page still loads, a note says which is missing,
