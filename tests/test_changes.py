@@ -26,6 +26,7 @@ def iso(ts):
 
 class ChangesTest(unittest.TestCase):
     def setUp(self):
+        api._gitlab_cache.clear()  # a GET answer cached by an earlier test must not answer this one
         self.tmp = tempfile.TemporaryDirectory()
         self.metrics = Path(self.tmp.name) / "metrics.db"
         m = sqlite3.connect(self.metrics)

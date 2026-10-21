@@ -1,5 +1,5 @@
 name: operations
-version: 0.1.0
+version: 0.3.0
 manifest_version: 2
 requires_hermes: ">=0.21.5"
 description: >-
@@ -7,9 +7,9 @@ description: >-
   hosts and model pool, request flow, activity, kanban and subagent handoffs
   (an open card can be assigned, started now or at a set time, or closed),
   request traces, merge requests with pipeline stages, a topology map with replay and the
-  model router's roles, fleet-standard conformance with host fixes by card or by hand, editable
-  role views, optional model-written Activity summaries, and alerts in Desktop (and optionally Discord) when
-  something new needs attention.
+  model router's roles, fleet-standard conformance with host fixes by card or by hand, optional
+  model-written Activity summaries, and the Notifications tab where alerts are listed, in Desktop
+  (and optionally Discord) as something new needs attention.
   Backend routes mount at /api/plugins/operations/; the desktop half (same id)
   renders the page.
 author: cpompa

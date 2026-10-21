@@ -58,6 +58,7 @@ SCHEMA = """CREATE TABLE conformance_results (id INTEGER PRIMARY KEY, ts REAL, h
 
 class ConformanceTest(unittest.TestCase):
     def setUp(self):
+        api._gitlab_cache.clear()  # a GET answer cached by an earlier test must not answer this one
         self.tmp = tempfile.TemporaryDirectory()
         self.metrics = Path(self.tmp.name) / "metrics.db"
         m = sqlite3.connect(self.metrics)

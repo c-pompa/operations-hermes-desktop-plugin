@@ -57,7 +57,8 @@ Or in Hermes Desktop: Capabilities > Plugins > Install from Git, with the same U
    and remembers the choice).
 2. Restart the dashboard so it mounts the backend.
 
-`hermes plugins update operations` pulls new versions. A fresh install opens a
+`hermes plugins update operations` pulls new versions; the version in Capabilities > Plugins moves
+with each release, and `CHANGELOG.md` says what changed in it. A fresh install opens a
 "Set up Operations" checklist on the Notifications tab (see [Setup checklist](#setup-checklist)).
 
 ## Page details
@@ -185,7 +186,10 @@ with.
   delegations (grouped by parent session, with each subagent's model and request count).
 - **Move an open card forward**, all through Hermes' own kanban functions:
   - hand it to a profile, whose worker starts at once with the card's history, under the same
-    kanban limits the gateway applies (the page says when it could not start, and why)
+    kanban limits the gateway applies (the page says when it could not start, and why). Only that
+    card starts, through `kanban_db_dispatch.start_task_once`, so the board's other ready cards are
+    left to the gateway's own tick. A Hermes that predates that function falls back to a
+    whole-board dispatch, and the page then names every other card it started
   - schedule it for a set time; the gateway hook in `__init__.py` puts it back to ready on the
     first dispatcher tick after that time, so it starts within about two minutes
   - reply to a blocked worker and unblock it (the reply goes on the card as "dashboard")
@@ -217,6 +221,9 @@ with.
 - Open MRs and those merged in the window, with counts by repo.
 - Who each is waiting on (a reviewer, or the author when the pipeline failed or there are
   conflicts) and for how long.
+- A window holding more than 40 open or 40 merged MRs says so: the list, the counts and the
+  "waiting on" summary are then of the newest 40, rather than of everything. The Overview's changes
+  card says the same when the window holds more merges than it lists.
 - The newest pipeline's stages: a retried job counts by its latest run, an allowed failure as
   passed. Each MR opens to its details with links to GitLab.
 
@@ -278,13 +285,18 @@ still run.
 
 **Business mode** (sending rules to a Hermes organisation's shared copy of the standard) is
 switched off in this version, whatever the account or sync settings. Every install runs in single
-user mode.
+user mode, and a proposal that asks for it is refused with 403 before anything is read.
 
 ### Notifications and alerts
 
 - While Desktop runs, Operations checks Needs attention every minute and alerts on each new item
   (a gateway that dropped, a health finding, a host that went quiet): a toast with a link, and a
   system notification while you are away (Settings > Notifications > "Plugin notifications").
+- A check that fails is not silent: after three failed checks in a row a toast says alerts are not
+  being checked, the Notifications tab keeps a line with the time they started failing and the last
+  error, and the poll backs off to every 5, 10 and then 15 minutes. It keeps trying, and one toast
+  says when it is checking again. A page that looks quiet because it cannot see anything is worse
+  than one that says so.
 - More than three at once arrive as one summary. Kanban cards are left to the Kanban plugin.
 - A health finding that suggests checking a session for a retry loop is corrected when that
   session's calls timed out instead: the model was slow or queued, which Trace shows.
@@ -302,9 +314,19 @@ user mode.
 A fresh install shows a toast once with the number of steps left, a "Set up Operations"
 checklist on the Notifications tab, and an "N setup steps left" link on Overview. The steps:
 
-- turn on `operations` under `plugins.enabled` in each profile (then restart Desktop; a profile
-  that lists it under `plugins.disabled` is left alone)
+- turn on `operations` under `plugins.enabled` in this profile (then restart Desktop; a profile
+  that lists it under `plugins.disabled` is left alone). The step is about the profile whose page
+  you are on: the other profiles are named, not required, since a profile only needs it to show
+  this page
 - the metrics collector and the kanban board
+- a GitLab login: Merge requests, merged changes and a fleet standard kept in a GitLab repo read
+  nothing without one. The step says which half is missing (host or token) and when the host is
+  set but does not answer, **and it can be finished in the page**: it offers the logins this
+  machine already holds (this profile's environment, another profile's `.env`, the `gitlab-mr`
+  plugin's host, the `glab` CLI) as one press each, or takes a host and token typed into a masked
+  field. It writes the plugin's own settings — the host through the plugin-settings writer, the
+  token through the `.env` credential route under `OPERATIONS_GITLAB_TOKEN` — and never sends a
+  token back to the page
 - the Conformance project and what happens when a host drifts
 - optionally, Discord alerts
 
@@ -317,7 +339,8 @@ Collapse folds the checklist to one line naming the steps still to do; this Desk
 ### Roles
 
 Viewing the page as a role (SRE, DevOps and so on) and editing roles is a business feature and is
-not available yet; everyone sees the Everyone view.
+not available yet; everyone sees the Everyone view, and the API that saves a role list answers 403
+rather than storing one the page cannot show.
 
 ## Settings
 
@@ -354,10 +377,11 @@ All optional, in Capabilities > Plugins > Operations (the gear), stored under
 | --- | --- |
 | `<hermes root>/metrics/metrics.db` ([hermes-metrics-dash](https://github.com/c-pompa/hermes-metrics-dash)) | requests, errors, hosts, conformance results |
 | the kanban board | cards, runs and handoffs |
-| GitLab | merge requests, pipelines, the fleet standard |
+| GitLab | merge requests, pipelines, the fleet standard. A GET answer is reused for 30 seconds, so a page polling every 30 s does not ask again for the same pipelines; a 429 is waited out once when GitLab says the wait is short and otherwise reported with its `Retry-After` |
 | `<hermes root>/plugin-data/gitlab-mr/device-aliases.json` | pairing hosts with pool devices |
 | profile `config.yaml` files | where the plugin is enabled, and which profiles can change router roles (`rolectl-mcp` with writes on) |
 | the model router's status endpoint | router roles: which models are loaded and with how much context |
+| other profiles' `.env`, the `gitlab-mr` plugin's settings and `~/.config/glab-cli/config.yml` | which GitLab logins already exist on this machine, so Connect GitLab can offer them; only the host and whether a token is there are shown |
 | LM Studio's local server (`LMSTUDIO_URL`, default `http://127.0.0.1:1234`) | which of a role's candidates it could load |
 
 Shell commands are only `git status`, `git rev-parse` and `git ls-files` in checked project folders
@@ -371,6 +395,9 @@ and nothing is created.
 
 - kanban cards (Handoffs and Conformance fix cards, through Hermes' own kanban functions)
 - merge requests proposing a rule (never main)
+- this plugin's own settings, when you press Connect GitLab: `gitlab_host` through the
+  plugin-settings writer and `gitlab_token` through the `.env` credential route, once, for the
+  profile you are on
 - its own files under `<hermes root>/plugin-data/operations/`: `roles.json`, `summaries.json`,
   `fixes.json`
 

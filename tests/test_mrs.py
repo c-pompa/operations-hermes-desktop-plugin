@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -101,6 +102,140 @@ class MrsRouteTest(unittest.TestCase):
         self.assertEqual(out["items"], [])
         self.assertIn("no GitLab login", out["errors"]["gitlab"])
 
+
+class FakeResp:
+    def __init__(self, text):
+        self.text = text
+
+    def read(self):
+        return self.text.encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class GitlabClientTest(unittest.TestCase):
+    """The client itself: the GET cache, and what a rate limit does."""
+
+    def setUp(self):
+        api._gitlab_cache.clear()
+        self.addCleanup(api._gitlab_cache.clear)
+        for patch in (mock.patch.object(api, "_gitlab_host", lambda: "gitlab.x"),
+                     mock.patch.object(api, "_gitlab_token", lambda: "tok")):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def serve(self, *replies):
+        """A fake urlopen: hands out the replies in order and counts the calls."""
+        self.calls = []
+
+        def urlopen(req, timeout=None):
+            self.calls.append(req.full_url)
+            reply = replies[min(len(self.calls) - 1, len(replies) - 1)]
+            if isinstance(reply, Exception):
+                raise reply
+            return FakeResp(reply)
+        return mock.patch.object(api.urllib.request, "urlopen", urlopen)
+
+    @staticmethod
+    def too_many(retry_after=None):
+        headers = {} if retry_after is None else {"Retry-After": str(retry_after)}
+        return urllib.error.HTTPError("https://gitlab.x/api/v4/user", 429, "Too Many Requests", headers, None)
+
+    def test_a_get_is_reused_for_the_ttl_and_a_post_never_is(self):
+        with self.serve('{"username": "cpompa"}'):
+            self.assertEqual(api._gitlab("user"), '{"username": "cpompa"}')
+            self.assertEqual(api._gitlab("user"), '{"username": "cpompa"}')
+            self.assertEqual(len(self.calls), 1)  # the second read came from the cache
+        # a write is a POST and must always reach GitLab
+        with self.serve('{"ok": true}'):
+            api._gitlab("projects/g%2Frepo/merge_requests", body={"a": 1})
+            api._gitlab("projects/g%2Frepo/merge_requests", body={"a": 1})
+            self.assertEqual(len(self.calls), 2)
+
+    def test_a_newer_answer_is_fetched_once_the_ttl_passes(self):
+        with self.serve('"first"', '"second"'):
+            self.assertEqual(api._gitlab("user"), '"first"')
+            api._gitlab_cache[("gitlab.x", "user")] = (api.time.time() - api.GITLAB_CACHE_S - 1, '"first"')
+            self.assertEqual(api._gitlab("user"), '"second"')
+        self.assertEqual(len(self.calls), 2)
+
+    def test_a_short_rate_limit_is_waited_out_once(self):
+        with mock.patch.object(api.time, "sleep") as sleep, self.serve(self.too_many(1), '{"username": "cpompa"}'):
+            self.assertEqual(api._gitlab("user"), '{"username": "cpompa"}')
+        sleep.assert_called_once_with(1.0)
+        self.assertEqual(len(self.calls), 2)
+
+    def test_a_long_rate_limit_is_reported_with_its_wait_instead_of_hammering(self):
+        with mock.patch.object(api.time, "sleep") as sleep, self.serve(self.too_many(60)):
+            with self.assertRaises(RuntimeError) as cm:
+                api._gitlab("user")
+        self.assertIn("retry after 60s", str(cm.exception))
+        self.assertEqual((len(self.calls), sleep.call_count), (1, 0))
+
+    def test_another_http_error_is_raised_as_it_is(self):
+        boom = urllib.error.HTTPError("https://gitlab.x/api/v4/user", 401, "Unauthorized", {}, None)
+        with self.serve(boom):
+            with self.assertRaises(urllib.error.HTTPError):
+                api._gitlab("user")
+
+
+class MergedPaginationTest(unittest.TestCase):
+    def page(self, n, start=0):
+        return [{"iid": i, "title": f"MR {i}", "references": {"full": f"g/repo!{i}"}, "web_url": f"u/{i}",
+                 "author": {"username": "dev"}, "merged_at": "2026-10-06T10:00:00Z"} for i in range(start, start + n)]
+
+    def test_reads_on_until_a_short_page(self):
+        pages = [self.page(100), self.page(1, 100)]
+        with mock.patch.object(api, "_gitlab", lambda path, body=None: json.dumps(pages.pop(0))):
+            rows, truncated = api.merged_pages(0.0)
+        self.assertEqual((len(rows), truncated), (101, False))
+
+    def test_a_window_busier_than_the_cap_says_it_is_truncated(self):
+        full = json.dumps(self.page(100))
+        paths = []
+        with mock.patch.object(api, "_gitlab", lambda path, body=None: (paths.append(path), full)[1]):
+            rows, truncated = api.merged_pages(0.0)
+        self.assertEqual((len(rows), truncated), (api.MERGED_MAX, True))
+        self.assertEqual(len(paths), api.MERGED_MAX // 100)
+        self.assertIn("page=5", paths[-1])  # it stopped at the cap, not at a short page
+
+
+class MrsLimitTest(unittest.TestCase):
+    """A window with more open or merged MRs than the page shows must say so."""
+
+    def mr(self, iid, state):
+        return {"iid": iid, "project_id": 7, "state": state, "title": f"MR {iid}", "web_url": f"u/{iid}",
+                "references": {"full": f"g/repo!{iid}"}, "author": {"username": "dev"},
+                "created_at": "2026-10-06T10:00:00Z", "updated_at": "2026-10-06T11:00:00Z"}
+
+    def test_a_page_past_the_limit_marks_the_window_as_truncated(self):
+        opened = [self.mr(i, "opened") for i in range(1, api.MRS_LIMIT + 2)]
+        paths = []
+
+        def fake(path, body=None):
+            paths.append(path)
+            return json.dumps(opened if "state=opened" in path else [])
+
+        with mock.patch.object(api, "_gitlab", fake):
+            out = api.merge_requests(hours=24)
+        self.assertTrue(out["truncated"])
+        self.assertEqual(len(out["items"]), api.MRS_LIMIT)
+        self.assertEqual(out["showing"], {"open": api.MRS_LIMIT, "merged": 0, "limit": api.MRS_LIMIT})
+        # one row past the limit is asked for, so "there is more" is a fact rather than a full page
+        self.assertTrue(all(f"per_page={api.MRS_LIMIT + 1}" in p for p in paths[:2]))
+
+    def test_a_window_that_fits_is_not_marked(self):
+        def fake(path, body=None):
+            return json.dumps([self.mr(1, "opened")] if "state=opened" in path else [])
+
+        with mock.patch.object(api, "_gitlab", fake):
+            out = api.merge_requests(hours=24)
+        self.assertFalse(out["truncated"])
+        self.assertEqual(out["showing"], {"open": 1, "merged": 0, "limit": api.MRS_LIMIT})
 
 if __name__ == "__main__":
     unittest.main()

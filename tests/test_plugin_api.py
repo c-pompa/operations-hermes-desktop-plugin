@@ -39,6 +39,7 @@ def rec(conn, **kw):
 
 class OverviewTest(unittest.TestCase):
     def setUp(self):
+        api._gitlab_cache.clear()  # a GET answer cached by an earlier test must not answer this one
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         self.metrics, self.kanban = root / "metrics.db", root / "kanban.db"

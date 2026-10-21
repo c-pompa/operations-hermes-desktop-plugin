@@ -8,6 +8,7 @@ import tempfile
 import time
 import types
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -63,11 +64,25 @@ class SetupRouteTest(unittest.TestCase):
             {"profile": "c", "state": "missing"}, {"profile": "default", "state": "on"}])
 
     def test_setup_reports_sources_and_settings(self):
-        with mock.patch.object(api, "_settings", lambda: {"conformance_project": " g/std ", "drift_action": "nonsense"}):
+        with mock.patch.object(api, "_settings", lambda: {"conformance_project": " g/std ", "drift_action": "nonsense"}), \
+                mock.patch.object(api, "gitlab_state", lambda: {"host": "", "has_token": False, "ok": False,
+                                                               "user": None, "error": "no GitLab host set"}):
             out = api.setup()
         self.assertEqual((out["metrics"], out["kanban"], out["conformance_project"]), (True, False, "g/std"))
         self.assertEqual((out["drift_action"], out["drift_profile"], out["alert_target"]), ("button", "", ""))
         self.assertEqual((out["profile"], out["settings_page"]), ("default", False))
+        # the checklist's GitLab step reads this key
+        self.assertEqual(out["gitlab"]["host"], "")
+
+    def test_gitlab_host_from_default_is_named(self):
+        entries = ("plugins:\n  entries:\n    operations:\n      settings:\n"
+                   "        gitlab_host: gitlab.cpompa.com\n")
+        (self.root / "config.yaml").write_text(entries)
+        (self.root / "profiles" / "b" / "config.yaml").write_text("plugins:\n  enabled: [operations]\n")
+        with mock.patch.object(api, "get_hermes_home", lambda: self.root / "profiles" / "b"), \
+                mock.patch.object(api, "gitlab_state", dict):
+            out = api.setup()
+        self.assertEqual(out["from_default"], ["gitlab_host"])
 
     def test_a_named_profile_with_its_own_copy_has_a_settings_page(self):
         home = self.root / "profiles" / "b"
@@ -172,12 +187,15 @@ await new Promise(r => setTimeout(r, 0))
 setupToast(ctx)
 await new Promise(r => setTimeout(r, 0))
 console.log(JSON.stringify({ left: steps.filter(x => !x.done).map(x => x.id), toasts: toasts.map(t => t.message),
-                             conformance: steps.find(x => x.id === 'conformance'), }))
+                             conformance: steps.find(x => x.id === 'conformance'),
+                             gitlab: steps.find(x => x.id === 'gitlab'),
+                             steps: Object.fromEntries(steps.map(x => [x.id, x])) }))
 """
 
 FRESH = {"profiles": [{"profile": "default", "state": "on"}, {"profile": "a", "state": "missing"},
                       {"profile": "b", "state": "off"}],
          "metrics": False, "kanban": True, "conformance_project": "", "alert_target": "",
+         "gitlab": {"host": "", "has_token": False, "ok": False, "user": None, "error": "no GitLab host set"},
          "drift_action": "automatic", "drift_profile": ""}
 
 
@@ -190,14 +208,67 @@ class ChecklistTest(unittest.TestCase):
 
     def test_fresh_install_lists_each_step_and_toasts_once(self):
         out = self.run_js(FRESH)
-        self.assertEqual(out["left"], ["profiles", "metrics", "conformance", "drift"])
+        # this profile has Operations on, so that step is done: eight profiles never needing the
+        # page must not leave a box nobody can tick
+        self.assertEqual(out["left"], ["metrics", "gitlab", "conformance", "drift"])
         self.assertEqual(out["toasts"], ["4 setup steps left"])
+
+    def test_the_profile_step_is_about_this_profile_and_names_the_others(self):
+        on = self.run_js({**FRESH, "profile": "backend-eng", "profiles": [
+            {"profile": "default", "state": "on"}, {"profile": "backend-eng", "state": "on"},
+            {"profile": "writer", "state": "missing"}]})["steps"]["profiles"]
+        self.assertTrue(on["done"])
+        self.assertIn("On in 2 of 3 profiles", on["text"])
+        self.assertIn("Not on in writer", on["text"])
+        off = self.run_js({**FRESH, "profile": "backend-eng", "profiles": [
+            {"profile": "backend-eng", "state": "off"}]})["steps"]["profiles"]
+        self.assertFalse(off["done"])
+        self.assertIn("plugins: disabled", off["text"])
 
     def test_done_install_has_nothing_left_and_no_toast(self):
         done = {**FRESH, "profiles": [{"profile": "default", "state": "on"}, {"profile": "b", "state": "off"}],
-                "metrics": True, "conformance_project": "g/std", "drift_action": "button"}
+                "metrics": True, "conformance_project": "g/std", "drift_action": "button",
+                "gitlab": {"host": "gitlab.cpompa.com", "has_token": True, "ok": True, "user": "cpompa", "error": ""}}
         out = self.run_js(done)
         self.assertEqual((out["left"], out["toasts"]), ([], []))
+
+    def test_the_gitlab_step_says_which_half_is_missing(self):
+        step = self.run_js({**FRESH, "profile": "coder", "settings_page": False,
+                            "gitlab": {"host": "gitlab.x", "has_token": False, "ok": False, "error": "no GitLab token set"}})["gitlab"]
+        self.assertFalse(step["done"])
+        self.assertIn("set but no token is", step["text"])
+        self.assertIn("hermes -p coder config set plugins.entries.operations.settings.gitlab_token", step["text"])
+        self.assertEqual(step["action"]["label"], "Copy command")
+        # a host answering is done, and says so by name
+        step = self.run_js({**FRESH, "gitlab": {"host": "gitlab.x", "has_token": True, "ok": True, "user": "cpompa", "error": ""}})["gitlab"]
+        self.assertEqual((step["done"], step["text"]), (True, "Connected to gitlab.x as cpompa."))
+        self.assertIsNone(step["action"])
+        # a host that is set but silent is not done, and its error is shown rather than a spinner
+        step = self.run_js({**FRESH, "gitlab": {"host": "gitlab.x", "has_token": True, "ok": False, "user": None, "error": "timed out"}})["gitlab"]
+        self.assertFalse(step["done"])
+        self.assertIn("did not answer (timed out)", step["text"])
+
+    def test_the_gitlab_step_offers_the_login_already_on_the_machine(self):
+        # a complete source for another host, and one for the host the plugin is pointed at:
+        # the matching one wins, so pressing it cannot quietly move the plugin to another GitLab
+        step = self.run_js({**FRESH, "gitlab": {
+            "host": "gitlab.cpompa.com", "has_token": False, "ok": False, "user": None, "error": "no GitLab token set",
+            "sources": [{"id": "glab", "label": "the glab CLI", "host": "gitlab.other", "has_token": True},
+                        {"id": "profile:ops", "label": "the ops profile's .env", "host": "gitlab.cpompa.com", "has_token": True}],
+        }})["gitlab"]
+        self.assertEqual(step["connect"]["source"], "profile:ops")
+        self.assertEqual(step["connect"]["label"], "the ops profile's .env")
+        self.assertEqual(step["connect"]["host"], "gitlab.cpompa.com")
+
+    def test_the_gitlab_step_offers_no_adoption_without_a_token_anywhere(self):
+        step = self.run_js({**FRESH, "gitlab": {
+            "host": "gitlab.cpompa.com", "has_token": False, "ok": False, "user": None, "error": "no GitLab token set",
+            "sources": [{"id": "gitlab-mr", "label": "the gitlab-mr plugin", "host": "gitlab.cpompa.com", "has_token": False}],
+        }})["gitlab"]
+        # the host is prefilled for typing a token, but nothing claims to be adoptable
+        self.assertIsNone(step["connect"]["source"])
+        self.assertEqual(step["connect"]["host"], "gitlab.cpompa.com")
+        self.assertEqual(step["connect"]["sources"], 1)
 
     def test_without_a_settings_form_a_step_gives_the_command_and_copies_it(self):
         step = self.run_js({**FRESH, "profile": "coder", "settings_page": False})["conformance"]
@@ -208,6 +279,63 @@ class ChecklistTest(unittest.TestCase):
         self.assertEqual(step["action"]["label"], "Open plugin settings")
         step = self.run_js({**FRESH, "conformance_project": "g/std", "from_default": ["conformance_project"]})["conformance"]
         self.assertEqual(step["text"], "Checking g/std. Set in the default profile.")
+
+
+class GitlabStateTest(unittest.TestCase):
+    """The checklist's probe of GitLab: no request without a login, one request per GITLAB_PROBE_S."""
+
+    def setUp(self):
+        self.calls = []
+        patches = [mock.patch.object(api, "_gitlab_host", lambda: "gitlab.cpompa.com"),
+                   mock.patch.object(api, "_gitlab_token", lambda: "tok")]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        api._GITLAB_PROBE.update(at=0.0, host="", value=None)
+        self.addCleanup(lambda: api._GITLAB_PROBE.update(at=0.0, host="", value=None))
+
+    def probe(self, reply):
+        def fake(path, body=None):
+            self.calls.append(path)
+            if isinstance(reply, Exception):
+                raise reply
+            return json.dumps(reply)
+        return mock.patch.object(api, "_gitlab", fake)
+
+    def test_a_missing_login_asks_nothing(self):
+        with mock.patch.object(api, "_gitlab_host", lambda: ""), self.probe({"username": "x"}):
+            out = api.gitlab_state()
+        self.assertEqual((out["ok"], out["has_token"], out["error"]), (False, True, "no GitLab host set"))
+        with mock.patch.object(api, "_gitlab_token", lambda: ""), self.probe({"username": "x"}):
+            out = api.gitlab_state()
+        self.assertEqual((out["ok"], out["has_token"], out["error"]), (False, False, "no GitLab token set"))
+        self.assertEqual(self.calls, [])
+
+    def test_a_login_that_answers_is_ok_and_cached_for_the_ttl(self):
+        with self.probe({"username": "cpompa"}):
+            first = api.gitlab_state()
+            again = api.gitlab_state()
+            fresh = api.gitlab_state(fresh=True)
+        self.assertEqual((first["ok"], first["user"]), (True, "cpompa"))
+        self.assertEqual(again["user"], "cpompa")
+        self.assertEqual(len(self.calls), 2)  # the cached read, then the fresh one
+        later = time.time() + api.GITLAB_PROBE_S + 1
+        with mock.patch.object(api.time, "time", lambda: later), self.probe({"username": "cpompa"}):
+            api.gitlab_state()
+        self.assertEqual(len(self.calls), 3)
+
+    def test_a_host_that_does_not_answer_says_why(self):
+        with self.probe(urllib.error.URLError("timed out")):
+            out = api.gitlab_state()
+        self.assertFalse(out["ok"])
+        self.assertIn("timed out", out["error"])
+        with self.probe(RuntimeError("401 Unauthorized")):
+            out = api.gitlab_state(fresh=True)
+        self.assertEqual(out["error"], "401 Unauthorized")
+        # an answer with no username is not a working login
+        with self.probe({}):
+            out = api.gitlab_state(fresh=True)
+        self.assertEqual((out["ok"], out["error"]), (False, "GitLab answered without a username"))
 
 
 if __name__ == "__main__":

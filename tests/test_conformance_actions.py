@@ -140,7 +140,17 @@ class BusinessModeOffTest(unittest.TestCase):
                                                     "role": None, "reason": "business mode is not available yet"})
         with self.assertRaises(HTTPException) as cm:
             api.propose_to_org("host_rules", {}, "", {})
-        self.assertEqual(cm.exception.status_code, 409)
+        self.assertEqual(cm.exception.status_code, 403)
+
+    def test_a_rule_for_the_org_is_refused_before_anything_is_read(self):
+        rule = {"id": "no-todo", "title": "No TODO", "severity": "warns", "why": "w", "fix": "f",
+                "check": {"kind": "absent", "pattern": "TODO", "paths": ["*.sh"]}}
+        with mock.patch.object(api, "_gitlab", side_effect=AssertionError("read GitLab before refusing")), \
+                mock.patch.object(api, "_project", lambda: "grp/std"):
+            with self.assertRaises(HTTPException) as cm:
+                api.propose_rule("host_rules", rule, "org")
+        self.assertEqual(cm.exception.status_code, 403)
+        self.assertIn("not available yet", cm.exception.detail)
 
 
 # Hermes dropped org skill sync upstream; org_mode then catches the ImportError and reports single mode

@@ -48,8 +48,8 @@
  *   GET /models/role?name= -> { role, min_context, candidates, lmstudio, repoint, agent } (read-only: what an
  *                             agent needs to bring the role back; agent also carries profiles and their models)
  *   GET /models/agents    -> { router, profiles: {name: default model}, rolectl_mcp, profile } (the once-a-day toast)
- *   POST /cards/{id}/assign {profile, start_at?} -> { ok, status, started, warning, starts_at? }
- *   POST /cards/{id}/unblock {comment}       -> { ok, status, started, warning }
+ *   POST /cards/{id}/assign {profile, start_at?} -> { ok, status, started, warning, also_started, starts_at? }
+ *   POST /cards/{id}/unblock {comment}       -> { ok, status, started, warning, also_started }
  *   POST /cards/{id}/close {outcome, result} -> { ok, status }
  *   GET /conformance      -> { project, standard, repo: [rule results], pipeline, errors }
  *   POST /conformance/hosts/{host}/fix {profile|null} -> a kanban card to fix the host's failing checks,
@@ -76,6 +76,9 @@ const PATH = '/operations'
 // Off until business mode is finished: everyone sees the first role, with no View as picker or role editor
 const VIEW_AS = false
 const REFRESH_MS = 30_000
+// One retry, then wait for the next poll. A dead plugin host answers 502 for minutes at a time, so
+// three fast retries per poll only tripled what the log recorded and never once changed the answer.
+const RETRY = { retry: 1, retryDelay: attempt => Math.min(30_000, 1000 * 2 ** attempt) }
 
 // set inside register(), the only place the plugin ctx exists
 let api = null
@@ -86,7 +89,8 @@ const useOverview = hours =>
   useQuery({
     queryKey: [ID, 'overview', hours],
     queryFn: () => api.rest(`/overview?hours=${hours}`, { timeoutMs: 45_000 }),
-    refetchInterval: REFRESH_MS
+    refetchInterval: REFRESH_MS,
+    ...RETRY
   })
 
 // GitLab is a separate call, so it gets its own query and a slower poll.
@@ -94,28 +98,32 @@ const useChanges = hours =>
   useQuery({
     queryKey: [ID, 'changes', hours],
     queryFn: () => api.rest(`/changes?hours=${hours}`, { timeoutMs: 45_000 }),
-    refetchInterval: 60_000
+    refetchInterval: 60_000,
+    ...RETRY
   })
 
 const useFlow = (hours, start) =>
   useQuery({
     queryKey: [ID, 'flow', hours, start],
     queryFn: () => api.rest(`/flow?hours=${hours}${start ? `&start=${start}` : ''}`, { timeoutMs: 45_000 }),
-    refetchInterval: REFRESH_MS
+    refetchInterval: REFRESH_MS,
+    ...RETRY
   })
 
 const useErrors = (hours, start) =>
   useQuery({
     queryKey: [ID, 'errors', hours, start],
     queryFn: () => api.rest(`/errors?hours=${hours}${start != null ? `&start=${start}` : ''}`, { timeoutMs: 45_000 }),
-    refetchInterval: REFRESH_MS
+    refetchInterval: REFRESH_MS,
+    ...RETRY
   })
 
 const useActivity = hours =>
   useQuery({
     queryKey: [ID, 'activity', hours],
     queryFn: () => api.rest(`/activity?hours=${hours}`, { timeoutMs: 45_000 }),
-    refetchInterval: REFRESH_MS
+    refetchInterval: REFRESH_MS,
+    ...RETRY
   })
 
 // Readable Activity summaries, when the install turned them on; asks again while some are pending.
@@ -124,21 +132,24 @@ const useSummaries = (hours, enabled) =>
     queryKey: [ID, 'summaries', hours],
     queryFn: () => api.rest('/activity/summaries', { method: 'POST', body: { hours }, timeoutMs: 90_000 }),
     enabled: !!enabled,
-    refetchInterval: q => (q.state.data?.pending ? 5_000 : REFRESH_MS)
+    refetchInterval: q => (q.state.data?.pending ? 5_000 : REFRESH_MS),
+    ...RETRY
   })
 
 const useHandoffs = (hours, start) =>
   useQuery({
     queryKey: [ID, 'handoffs', hours, start],
     queryFn: () => api.rest(`/handoffs?hours=${hours}${start ? `&start=${start}` : ''}`, { timeoutMs: 45_000 }),
-    refetchInterval: REFRESH_MS
+    refetchInterval: REFRESH_MS,
+    ...RETRY
   })
 
 const useTrace = (hours, start) =>
   useQuery({
     queryKey: [ID, 'trace', hours, start],
     queryFn: () => api.rest(`/trace?hours=${hours}${start ? `&start=${start}` : ''}`, { timeoutMs: 45_000 }),
-    refetchInterval: REFRESH_MS
+    refetchInterval: REFRESH_MS,
+    ...RETRY
   })
 
 const useSessionTrace = sid =>
@@ -146,14 +157,16 @@ const useSessionTrace = sid =>
     queryKey: [ID, 'trace', 'session', sid],
     queryFn: () => api.rest(`/trace/${encodeURIComponent(sid)}`, { timeoutMs: 45_000 }),
     enabled: !!sid,
-    refetchInterval: REFRESH_MS
+    refetchInterval: REFRESH_MS,
+    ...RETRY
   })
 
 const useTopology = hours =>
   useQuery({
     queryKey: [ID, 'topology', hours],
     queryFn: () => api.rest(`/topology?hours=${hours}`, { timeoutMs: 45_000 }),
-    refetchInterval: REFRESH_MS
+    refetchInterval: REFRESH_MS,
+    ...RETRY
   })
 
 const useRoles = () => useQuery({ queryKey: [ID, 'roles'], queryFn: () => api.rest('/roles'), staleTime: 5 * 60_000 })
@@ -162,7 +175,8 @@ const useConformance = () =>
   useQuery({
     queryKey: [ID, 'conformance'],
     queryFn: () => api.rest('/conformance', { timeoutMs: 45_000 }),
-    refetchInterval: 5 * 60_000
+    refetchInterval: 5 * 60_000,
+    ...RETRY
   })
 
 // Hermes' own projects and repos, as the sidebar lists them for the profile Desktop is on (the gateway
@@ -187,7 +201,8 @@ const useProjectChecks = () =>
       return { ...data, names: Object.fromEntries(names), current, created: [...created], listed: !!(listed || found) }
     },
     // A repo unchanged since its last check is not read again, so this is cheap.
-    refetchInterval: 60_000
+    refetchInterval: 60_000,
+    ...RETRY
   })
 
 // --- formatting ---------------------------------------------------------------------
@@ -973,6 +988,7 @@ function Changes({ hours }) {
     className: 'divide-y divide-(--ui-stroke-secondary)',
     children: [
       ...errors,
+      data.truncated ? jsx('div', { className: 'text-xs text-(--ui-text-quaternary)', children: `Showing the newest ${data.items.length} changes; the window holds more.` }) : null,
       !data.items.length ? muted('No merged MRs or model loads in this window.') : null,
       ...data.items.map((c, i) =>
         jsxs('div', {
@@ -4964,21 +4980,44 @@ const useSetup = () => useQuery({ queryKey: [ID, 'setup'], queryFn: () => api.re
 // What a first run still needs, each with where to fix it. Discord alerts are optional and never
 // count as left; the drift step only exists with a kanban board, since cards need one.
 function setupSteps(s) {
-  const missing = s.profiles.filter(p => p.state === 'missing').map(p => p.profile)
+  // This profile is the one that decides the step: a profile only needs Operations on to show this
+  // page, and most of them never will (workers, monitors, chat-only profiles). Asking for every
+  // profile made a step nobody could finish, so the rest are named, not required.
+  const profiles = s.profiles || []
+  const mine = profiles.find(p => p.profile === (s.profile || 'default')) || null
+  const missing = profiles.filter(p => p.state === 'missing').map(p => p.profile)
+  const on = profiles.filter(p => p.state === 'on').length
   // no settings form in this profile: the button copies the command the step names instead
   const settings = (key, value) => s.settings_page
     ? { label: 'Open plugin settings', onClick: () => host.navigate(SETTINGS_PATH) }
     : { label: 'Copy command', onClick: () => navigator.clipboard?.writeText(settingsCmd(s, key, value)).catch(() => {}) }
   const fromDefault = key => (s.from_default || []).includes(key) ? ' Set in the default profile.' : ''
   return [
-    { id: 'profiles', done: !missing.length, title: 'Turn Operations on in every profile',
-      text: missing.length
-        ? `Not on in ${missing.join(', ')}. Desktop shows this page only for profiles that list it: add "- operations" under plugins: enabled: in each one's config.yaml (~/.hermes/profiles/<profile>/config.yaml, or ~/.hermes/config.yaml for default), then restart Hermes Desktop. A profile that lists it under plugins: disabled: is left as it is.`
-        : 'On in every profile.' },
+    { id: 'profiles', done: !mine || mine.state === 'on', title: 'Turn Operations on in this profile',
+      text: !mine || mine.state === 'on'
+        ? `On in ${on} of ${plural(profiles.length, 'profile')}; that is enough, a profile only needs it to show this page.${missing.length ? ` Not on in ${missing.join(', ')}.` : ''}`
+        : mine.state === 'off'
+          ? `${s.profile || 'default'} lists Operations under plugins: disabled, so it stays hidden there. Remove it from that list in ${s.profile === 'default' ? '~/.hermes/config.yaml' : `~/.hermes/profiles/${s.profile}/config.yaml`}, then restart Hermes Desktop.`
+          : `Not on in ${s.profile || 'default'}: add "- operations" under plugins: enabled: in ${s.profile === 'default' || !s.profile ? '~/.hermes/config.yaml' : `~/.hermes/profiles/${s.profile}/config.yaml`}, then restart Hermes Desktop.` },
     { id: 'metrics', done: s.metrics, title: 'Connect the metrics collector',
       text: s.metrics ? 'metrics.db found.' : 'No metrics.db under ~/.hermes/metrics yet. Install hermes-metrics-dash (github.com/c-pompa/hermes-metrics-dash) on this machine and its forwarder on each host; until then requests, hosts and the model pool read as empty.' },
     { id: 'kanban', done: s.kanban, title: 'Create the kanban board',
       text: s.kanban ? 'Board found.' : 'No kanban board yet. Run hermes kanban init (or open the Kanban page) so cards can be handed to profiles and fix cards can be filed.' },
+    { id: 'gitlab', done: !!(s.gitlab && s.gitlab.ok), title: 'Connect GitLab',
+      text: !s.gitlab || !s.gitlab.host
+        ? 'No GitLab host yet, so Merge requests, merged changes and a fleet standard kept in a GitLab repo stay empty.'
+          + settingsHint(s, 'gitlab_host', 'gitlab.example.com')
+        : !s.gitlab.has_token
+          ? `GitLab host ${s.gitlab.host} is set but no token is: Merge requests, changes and the fleet standard read nothing without one (read_api is enough).${fromDefault('gitlab_host')}`
+            + settingsHint(s, 'gitlab_token', '<token>')
+          : s.gitlab.ok
+            ? `Connected to ${s.gitlab.host}${s.gitlab.user ? ` as ${s.gitlab.user}` : ''}.${fromDefault('gitlab_host')}`
+            : `GitLab host ${s.gitlab.host} did not answer (${s.gitlab.error}), so Merge requests and changes stay empty until it does.${fromDefault('gitlab_host')}`,
+      // in the page: adopt a login already here, or type the pair (see GitlabConnect). The settings
+      // form / copy-command path stays for anyone who would rather do it that way.
+      connect: gitlabConnect(s),
+      action: s.gitlab && s.gitlab.ok ? null
+        : s.gitlab && s.gitlab.host ? settings('gitlab_token', '<token>') : settings('gitlab_host', 'gitlab.example.com') },
     { id: 'conformance', done: !!s.conformance_project, title: 'Pick the fleet standard',
       text: s.conformance_project ? `Checking ${s.conformance_project}.${fromDefault('conformance_project')}` : 'Set Conformance project to a GitLab repo whose CI publishes conformance-report.json or to a local conformance.yaml, or start a local standard on the Conformance tab; its fleet checks stay off until then.' + settingsHint(s, 'conformance_project', '<group/project>'),
       action: s.conformance_project ? null : settings('conformance_project', '<group/project>') },
@@ -5032,8 +5071,75 @@ function rolectlToast(ctx) {
   ctx.onDispose(() => clearInterval(timer))
 }
 
+// The login this machine already holds that the step can adopt in one press: a source with both a
+// host and a token, preferring one for the host the plugin is already pointed at.
+function gitlabConnect(s) {
+  const gl = s.gitlab || {}
+  const sources = gl.sources || []
+  const complete = sources.filter(x => x.host && x.has_token)
+  const best = complete.find(x => x.host === gl.host) || complete[0] || null
+  return { source: best ? best.id : null, label: best ? best.label : null, host: gl.host || '', sources: sources.length }
+}
+
+// Connect GitLab without a terminal: adopt a login already on this machine, or type the pair here.
+// Both go to POST /setup/gitlab, which writes the plugin's own settings (host in config.yaml, token
+// in the profile's .env) and answers with the probe; the token never comes back to this page.
+function GitlabConnect({ step, onDone }) {
+  const c = step.connect || {}
+  const [host, setHost] = useState(c.host || '')
+  const [token, setToken] = useState('')
+  const [form, setForm] = useState(!c.source)
+  const [busy, setBusy] = useState(false)
+  const [note, setNote] = useState(null)
+  const send = async body => {
+    setBusy(true)
+    setNote(null)
+    try {
+      const out = await api.rest('/setup/gitlab', { method: 'POST', body, timeoutMs: 30_000 })
+      const gl = out.gitlab || {}
+      setToken('')
+      setNote(gl.ok
+        ? { text: `Connected to ${gl.host}${gl.user ? ` as ${gl.user}` : ''}.` }
+        : { bad: true, text: `Saved, but GitLab did not answer: ${gl.error || 'no answer'}` })
+      onDone?.()
+    } catch (e) {
+      setNote({ bad: true, text: String(e?.message || e) })
+    } finally {
+      setBusy(false)
+    }
+  }
+  const field = (label, props) => jsxs('label', { className: 'flex items-center gap-1.5', children: [
+    jsx('span', { className: 'w-16 shrink-0 text-(--ui-text-quaternary)', children: label }),
+    jsx('input', {
+      className: 'min-w-0 flex-1 rounded border border-(--ui-stroke-secondary) bg-transparent px-1.5 py-1 text-xs',
+      style: { fontFamily: MONO }, spellCheck: false, autoComplete: 'off', ...props
+    })
+  ] })
+  return jsxs('div', { className: 'mt-1 space-y-1.5 pl-4', children: [
+    c.source && !form
+      ? jsx(Button, { size: 'xs', variant: 'outline', disabled: busy,
+          onClick: () => send({ source: c.source }),
+          children: busy ? 'Connecting…' : `Use the login from ${c.label}` })
+      : null,
+    c.source && form
+      ? jsx('div', { className: 'text-[0.6875rem] text-(--ui-text-quaternary)', children: `One is already on this machine (${c.label}).` })
+      : null,
+    form
+      ? jsxs('div', { className: 'space-y-1.5', children: [
+          field('Host', { value: host, placeholder: 'gitlab.example.com', onChange: e => setHost(e.target.value.trim()) }),
+          field('Token', { value: token, type: 'password', placeholder: 'read_api token', onChange: e => setToken(e.target.value.trim()) }),
+          jsx(Button, { size: 'xs', variant: 'outline', disabled: busy || !host || !token, onClick: () => send({ host, token }), children: busy ? 'Connecting…' : 'Connect' })
+        ] })
+      : null,
+    c.source && !form
+      ? jsx('button', { type: 'button', className: 'text-[0.6875rem] text-(--ui-text-quaternary) underline', onClick: () => setForm(true), children: 'Use a different host or token' })
+      : null,
+    note ? jsx('div', { className: 'text-[0.6875rem]', style: { color: note.bad ? TONE.bad : TONE.good }, children: note.text }) : null
+  ] })
+}
+
 function SetupChecklist() {
-  const { data } = useSetup()
+  const { data, refetch } = useSetup()
   const [hidden, setHidden] = useState(() => { try { return api.storage.get(SETUP_HIDDEN, false) } catch { return false } })
   const [collapsed, setCollapsed] = useState(() => storeGet(SETUP_COLLAPSED, false))
   if (!data || hidden) return null
@@ -5065,7 +5171,11 @@ function SetupChecklist() {
         jsx('span', { style: { marginTop: 3, width: 8, height: 8, flex: 'none', borderRadius: 4, border: `1.5px solid ${x.done ? TONE.good : TONE.warn}`, backgroundColor: x.done ? TONE.good : 'transparent' } }),
         jsxs('div', { className: 'flex-1 space-y-0.5', children: [
           jsx('div', { className: cn('font-medium', x.done && 'text-(--ui-text-quaternary)'), children: x.title }),
-          jsx('div', { className: 'text-(--ui-text-quaternary)', style: { userSelect: 'text' }, children: x.text })
+          jsx('div', { className: 'text-(--ui-text-quaternary)', style: { userSelect: 'text' }, children: x.text }),
+          // the one step that can be finished right here, without a terminal
+          x.id === 'gitlab' && !x.done && x.connect
+            ? jsx(GitlabConnect, { step: x, onDone: () => refetch() })
+            : null
         ] }),
         x.action ? jsx(Button, { size: 'xs', variant: 'outline', onClick: x.action.onClick, children: x.action.label }) : null
       ] })),
@@ -5199,7 +5309,8 @@ const useMrs = hours =>
   useQuery({
     queryKey: [ID, 'mrs', hours],
     queryFn: () => api.rest(`/mrs?hours=${hours}`, { timeoutMs: 60_000 }),
-    refetchInterval: 60_000
+    refetchInterval: 60_000,
+    ...RETRY
   })
 
 const pips = (stages, size = 9) =>
@@ -5255,6 +5366,9 @@ function MrsPage({ sel: initial }) {
     children: [
       jsx('div', { className: 'text-sm font-semibold', children: `${open.length} open, ${merged.length} merged` }),
       jsx('div', { children: `Merged counts the last ${plural(hours, 'hour')}; open counts every open MR you can see.` }),
+      data.truncated
+        ? jsx('div', { className: 'text-(--ui-warn, #d29922)', children: `Showing the newest ${(data.showing || {}).limit || items.length} open and the newest ${(data.showing || {}).limit || ''} merged: this window has more, so the counts below are of what is shown.` })
+        : null,
       head('Waiting on'),
       ...(waiting.length ? waiting.map(([m, w]) => kv(m.id, w, fmtDur(now - m.created))) : [muted('Nothing open is waiting on review or a fix.')]),
       repos.length ? head('By repo') : null,
@@ -5421,7 +5535,7 @@ function AlertActions({ a }) {
 
 // An alert's details on the Notifications tab: when, whether it is still open, where to see it, and the actions.
 function AlertDetail({ a }) {
-  const { data: open } = useQuery({ queryKey: [ID, 'attention'], queryFn: () => api.rest('/attention'), refetchInterval: 60_000 })
+  const { data: open } = useQuery({ queryKey: [ID, 'attention'], queryFn: () => api.rest('/attention'), refetchInterval: 60_000, ...RETRY })
   const now = open && (open.items || []).find(i => i.key === a.key)
   const line = (label, text) => jsxs('div', { children: [jsx('span', { className: 'text-(--ui-text-quaternary)', children: `${label}: ` }), text] })
   return jsxs('div', {
@@ -5442,6 +5556,7 @@ function AlertDetail({ a }) {
 
 function NotificationsPage({ onRead }) {
   const [log, setLog] = useState(() => storeGet(ALERT_LOG, []))
+  const [health, setHealth] = useState(() => storeGet(ALERT_HEALTH, null))
   const [readAt, setReadAt] = useState(() => storeGet(ALERT_READ, 0))
   const [opened, setOpened] = useState(null)
   // re-read storage before writing: the alert poll may have added entries since this page opened
@@ -5449,14 +5564,16 @@ function NotificationsPage({ onRead }) {
   const markRead = a => save(storeGet(ALERT_LOG, []).map(x => x.key === a.key && x.at === a.at ? { ...x, read: true } : x))
   const markAll = () => { const now = Date.now(); try { api.storage.set(ALERT_READ, now) } catch {} setReadAt(now); save(storeGet(ALERT_LOG, [])) }
   const clear = () => save([])
-  // pick up what the alert poll adds while this page is open
+  // pick up what the alert poll adds while this page is open, and whether it is still able to check
   useEffect(() => {
     const t = setInterval(() => {
       const next = storeGet(ALERT_LOG, [])
       if (JSON.stringify(next) !== JSON.stringify(log)) { setLog(next); onRead() }
+      const h = storeGet(ALERT_HEALTH, null)
+      if (JSON.stringify(h) !== JSON.stringify(health)) setHealth(h)
     }, 5000)
     return () => clearInterval(t)
-  }, [log])
+  }, [log, health])
   const unread = log.filter(a => isUnread(a, readAt)).length
   return jsxs('div', {
     className: 'space-y-3 p-4',
@@ -5469,6 +5586,19 @@ function NotificationsPage({ onRead }) {
         log.length ? jsx('button', { type: 'button', className: 'text-[0.6875rem] text-(--ui-text-quaternary) underline', onClick: clear, children: 'Clear' }) : null
       ] }),
       jsx(SetupChecklist, {}),
+      // A poll that cannot read Needs attention says so here, with the moment it started: the
+      // alternative is a page that looks quiet because it is deaf.
+      health ? jsxs('div', {
+        className: 'flex items-start gap-2 rounded-md border px-3 py-2 text-xs',
+        style: { borderColor: 'color-mix(in srgb, ' + TONE.bad + ' 55%, transparent)', backgroundColor: 'color-mix(in srgb, ' + TONE.bad + ' 10%, transparent)' },
+        children: [
+          jsx(Tag, { tone: 'bad', children: 'not checking' }),
+          jsxs('div', { className: 'min-w-0 flex-1 space-y-0.5', children: [
+            jsx('div', { className: 'font-medium leading-snug', children: `No alert checks since ${new Date(health.since).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}` }),
+            jsx('div', { className: 'leading-snug text-(--ui-text-quaternary)', children: `${plural(health.fails, 'failed attempt')}, last at ${new Date(health.at || health.since).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}: ${health.error}. It keeps retrying on its own, and Needs attention may have changed while it could not look.` })
+          ] })
+        ]
+      }) : null,
       !log.length
         ? muted('No alerts yet. When something new shows under Needs attention, it is listed here as well as in a toast. Kanban card alerts come from the Kanban plugin.')
         : jsx('div', { className: 'overflow-hidden rounded-md border border-(--ui-stroke-secondary)', children: log.map((a, i) => {
@@ -5622,21 +5752,52 @@ function OperationsPage() {
 // that). Kanban items are left to the Kanban plugin, which already notifies when a card blocks.
 // Seen keys persist, so a restart does not re-alert; the first run only records what is there.
 // A key that clears is forgotten, so it alerts again if it comes back.
+// A poll that fails is not silent: three failures in a row are worth a toast and a line on the
+// Notifications tab, because an alert engine nobody can see is worse than none: it reads as "quiet".
+// After that the poll backs off (60s, then 5m, 10m, 15m) and keeps trying, so a plugin host that
+// comes back is picked up without a restart.
 const ALERT_POLL_MS = 60_000
 const ALERT_SEEN = 'alerts.seen'
 const ALERT_LOG = 'alerts.log'
 const ALERT_READ = 'alerts.read'
 const ALERT_LOG_MAX = 200
+// failures so far -> how long to wait before the next attempt (index 0 is the first poll)
+const ALERT_BACKOFF_MS = [0, 0, 0, 300_000, 600_000, 900_000]
+const ALERT_NOTICE_AFTER = 3
+const ALERT_HEALTH = 'alerts.health'
 
 function startAlerts(ctx) {
   let seen = ctx.storage.get(ALERT_SEEN, null)
+  let fails = 0
+  let nextAt = 0
   const poll = async () => {
+    if (Date.now() < nextAt) return
     let out
     try {
       out = await ctx.rest('/attention')
-    } catch {
+    } catch (e) {
+      fails += 1
+      const before = ctx.storage.get(ALERT_HEALTH, null) || {}
+      const since = before.since || Date.now()
+      nextAt = Date.now() + ALERT_BACKOFF_MS[Math.min(fails, ALERT_BACKOFF_MS.length - 1)]
+      // One line for the Notifications tab, one toast as it starts failing, then nothing until it recovers.
+      try { ctx.storage.set(ALERT_HEALTH, { fails, since, error: String(e?.message || e), at: Date.now() }) } catch {}
+      if (fails === ALERT_NOTICE_AFTER) {
+        host.notify({
+          kind: 'error',
+          title: 'Operations: alerts are not being checked',
+          message: 'Needs attention cannot be read, so nothing is being alerted.',
+          detail: `${String(e?.message || e)} The Notifications tab says when this started; checking resumes on its own.`,
+          action: { label: 'Open Operations', onClick: () => host.navigate(PATH) }
+        })
+      }
       return
     }
+    const recovering = fails >= ALERT_NOTICE_AFTER
+    fails = 0
+    nextAt = 0
+    try { ctx.storage.set(ALERT_HEALTH, null) } catch {}
+    if (recovering) host.notify({ kind: 'info', title: 'Operations: alerts are being checked again', message: 'Needs attention is readable, so new items alert as they appear.' })
     const items = (out.items || []).filter(i => i.key && i.source !== 'kanban')
     const fresh = seen ? items.filter(i => !seen.includes(i.key)) : []
     // With a source unreadable, its items are missing, not cleared: keep them as seen.

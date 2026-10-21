@@ -79,6 +79,71 @@ class AlertsTest(unittest.TestCase):
         self.assertEqual(len(out["os"]), 1)
 
 
+# A clock the test moves, so the backoff after a run of failures is exercised without waiting minutes.
+HEALTH_HARNESS = """
+const PATH = '/operations'
+let now = 1_000_000_000_000
+Date.now = () => now
+const toasts = [], store = {}
+let tick = null
+const host = { notify: n => toasts.push(n), navigate: () => {} }
+globalThis.setInterval = fn => { tick = fn; return 1 }
+%s
+const polls = %s
+const ctx = {
+  rest: async () => { const p = polls.length ? polls.shift() : { items: [] }; if (p === 'down') throw new Error('502 plugin host'); return p },
+  storage: { get: (k, d) => (k in store ? store[k] : d), set: (k, v) => { store[k] = v } },
+  os: { notify: () => {} },
+  onDispose: () => {}
+}
+const flush = () => new Promise(r => setTimeout(r, 0))
+const out = []
+startAlerts(ctx)
+await flush()
+// each step: advance the clock a minute, then let the interval run
+for (const minutes of %s) {
+  for (let i = 0; i < minutes; i += 1) { now += 60_000; await tick(); await flush() }
+  out.push({ pollsLeft: polls.length, toasts: toasts.map(t => t.title), health: store['alerts.health'] ? { fails: store['alerts.health'].fails, since: store['alerts.health'].since - 1_000_000_000_000 } : null })
+}
+console.log(JSON.stringify(out))
+"""
+
+
+@unittest.skipUnless(shutil.which("node"), "node not installed")
+class AlertHealthTest(unittest.TestCase):
+    """A poll that cannot read Needs attention is reported, backed off, and reported again on recovery."""
+
+    def run_ticks(self, polls, minutes):
+        out = subprocess.run(["node", "--input-type=module", "-e",
+                              HEALTH_HARNESS % (ALERTS, json.dumps(polls), json.dumps(minutes))],
+                             capture_output=True, text=True, check=True)
+        return json.loads(out.stdout)
+
+    def test_three_failures_toast_once_and_the_health_line_keeps_the_first(self):
+        # startAlerts polls once at once, then every minute: 1 failure at t0, 2 at +60s, 3 at +120s,
+        # which is where the 5 minute backoff starts. The attempt at +420s is the next one let through.
+        out = self.run_ticks(["down"] * 9, [1] * 9)
+        health = [step["health"] for step in out]
+        self.assertEqual([h["fails"] if h else None for h in health], [2, 3, 3, 3, 3, 3, 4, 4, 4])
+        # since stays the first failure's moment, not the latest attempt's
+        self.assertEqual([h["since"] for h in health], [0] * 9)
+        # the harness reports the toast list cumulatively, so the last step holds all of them
+        self.assertEqual(out[-1]["toasts"], ["Operations: alerts are not being checked"])
+
+    def test_a_recovered_poll_says_so_and_clears_the_line(self):
+        out = self.run_ticks(["down", "down", "down", {"items": []}], [1, 1, 1, 6])
+        self.assertIsNotNone(out[2]["health"])
+        self.assertIsNone(out[3]["health"])
+        self.assertEqual(out[3]["toasts"], ["Operations: alerts are not being checked",
+                                            "Operations: alerts are being checked again"])
+
+    def test_one_failure_is_retried_on_the_next_poll(self):
+        a = item("host:mbp", "mbp stale")
+        out = self.run_ticks(["down", {"items": [a]}, {"items": [a]}], [1, 1, 1])
+        self.assertEqual([step["toasts"] for step in out], [[], [], []])
+        self.assertIsNone(out[2]["health"])
+
+
 NOTIFY = JS[JS.index("// --- notifications"):JS.index("function NotificationsPage")]
 
 

@@ -45,6 +45,7 @@ class TraceTopologyTest(unittest.TestCase):
     real_router_roles = staticmethod(api.router_roles)
 
     def setUp(self):
+        api._gitlab_cache.clear()  # a GET answer cached by an earlier test must not answer this one
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         self.db = root / "metrics.db"

@@ -27,20 +27,35 @@ class ScheduleTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.saved = api._KANBAN_DB
         api._KANBAN_DB = Path(self.tmp.name) / "kanban.db"
+        self.ws = Path(self.tmp.name) / "ws"
+        self.ws.mkdir()
+        # workspace_kind "dir" keeps the test out of the real ~/.hermes workspaces root
         with connect_closing(api._KANBAN_DB) as k:
-            self.card = kanban_db.create_task(k, title="Later card", created_by="cloud")
+            self.card = kanban_db.create_task(k, title="Later card", created_by="cloud",
+                                              workspace_kind="dir", workspace_path=str(self.ws))
         profiles = mock.patch.object(api.kanban_db, "list_profiles_on_disk", return_value=["default", "coder"])
         profiles.start()
         self.addCleanup(profiles.stop)
+        known = mock.patch.object(api.kbd, "_profile_exists_fn",
+                                  lambda: (lambda name: name in ("default", "coder")))
+        known.start()
+        self.addCleanup(known.stop)
 
     def tearDown(self):
         api._KANBAN_DB = self.saved
         self.tmp.cleanup()
 
     def assign(self, start_at):
-        with mock.patch.object(api.kbd, "dispatch_once", return_value=api.kbd.DispatchResult()) as tick, \
+        """Assign and start; returns the response and the cards a worker was actually spawned for."""
+        self.spawned = []
+
+        def spawn(task, workspace, board=None):
+            self.spawned.append(task.id)
+            return 4242
+        with mock.patch.object(api.kbd, "_default_spawn", spawn), \
+                mock.patch.object(api.kbd, "dispatch_once", side_effect=AssertionError("whole-board tick")), \
                 mock.patch("hermes_cli.kanban._check_dispatcher_presence", return_value=(True, "")):
-            return api.card_assign(self.card, "coder", start_at), tick.call_count
+            return api.card_assign(self.card, "coder", start_at), self.spawned
 
     def task(self):
         with connect_closing(api._KANBAN_DB) as k:
@@ -48,8 +63,8 @@ class ScheduleTest(unittest.TestCase):
 
     def test_a_later_start_parks_the_card_and_the_hook_reads_the_time_back(self):
         at = int(time.time()) + 3600
-        out, ticks = self.assign(at)
-        self.assertEqual((out["status"], out["starts_at"], out["started"], ticks), ("scheduled", at, False, 0))
+        out, spawns = self.assign(at)
+        self.assertEqual((out["status"], out["starts_at"], out["started"], spawns), ("scheduled", at, False, []))
         self.assertEqual((self.task().status, self.task().assignee), ("scheduled", "coder"))
         with connect_closing(api._KANBAN_DB) as k:
             self.assertEqual((hook.start_at(k, self.card), api._start_at(k, self.card)), (at, at))
@@ -71,10 +86,14 @@ class ScheduleTest(unittest.TestCase):
             kanban_db.schedule_task(k, self.card, reason="waiting on a vendor")
             self.assertEqual(hook.release_due(k, time.time() + 10 ** 9), [])
 
+    # a targeted start needs start_task_once; a Hermes without it ticks the whole board instead,
+    # which this harness forbids, so the case only means anything on a core that has it
+    @unittest.skipUnless(hasattr(api.kbd, "start_task_once"), "this Hermes predates start_task_once")
     def test_assigning_a_scheduled_card_without_a_time_starts_it_now(self):
         self.assign(int(time.time()) + 3600)
-        out, ticks = self.assign(None)
-        self.assertEqual((out["status"], ticks), ("ready", 1))
+        out, spawns = self.assign(None)
+        # it starts now, and only it
+        self.assertEqual((out["status"], out["started"], spawns), ("running", True, [self.card]))
 
     def test_rescheduling_moves_the_start(self):
         self.assign(int(time.time()) + 3600)

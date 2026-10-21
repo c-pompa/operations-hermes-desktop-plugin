@@ -1,9 +1,9 @@
 {
   "name": "operations",
   "label": "Operations",
-  "description": "Operations overview: vitals, today's activity, what needs attention, and hosts, from the metrics collector and kanban",
+  "description": "Operations for a fleet: vitals and today's activity, what needs attention, hosts and the model pool, request flow, activity, handoffs, traces, merge requests, topology with replay, conformance checks and alerts",
   "icon": "Activity",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "tab": {
     "path": "/operations",
     "hidden": true

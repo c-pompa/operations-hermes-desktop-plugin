@@ -47,8 +47,12 @@ child's model and request count), plus totals per (from, to) pair.
 
 GET /assignees lists the profiles a card can be handed to. POST
 /cards/{id}/assign {"profile"} hands an open card to one and, when the card is
-ready, starts that profile's worker at once (one dispatcher tick, with the
-kanban limits from config.yaml that the gateway applies); with "start_at"
+ready, starts that profile's worker at once through
+kanban_db_dispatch.start_task_once: that card only, under the board's own dispatch
+lock, with the kanban limits from config.yaml that the gateway applies. No other
+card is claimed or started, so a button here cannot disturb a card someone is
+holding; a Hermes that predates start_task_once falls back to a whole-board tick
+and names every other card it started in "also_started". With "start_at"
 (epoch seconds) it parks the card in kanban's "scheduled" status instead, and
 the plugin's dispatch-tick hook (../__init__.py) releases it at that time. POST
 /cards/{id}/unblock {"comment"} answers a blocked card (the comment goes on the
@@ -95,11 +99,21 @@ when there is a fleet standard (see GET /conformance), that standard's "absent" 
 
 GET /setup returns what a first run still needs, for the Overview page's setup checklist: each
 profile with operations on, off (listed under plugins.disabled) or missing from plugins.enabled,
-whether metrics.db and the kanban board exist, and the conformance_project, alert_target,
+whether metrics.db and the kanban board exist, whether GitLab answers (its host, whether a token is
+set, and one GET /user at most every five minutes, since Merge requests, changes and a GitLab fleet
+standard read nothing without it), and the conformance_project, alert_target,
 drift_action and drift_profile settings, and from_default: which of those this profile takes from
 the default profile's settings. Also the requesting profile and settings_page: whether
 Hermes Desktop has a settings form for operations there, which it only builds for a profile with
 its own copy under <profile>/plugins (a root-only install has none in named profiles). Read only.
+
+POST /setup/gitlab {"source": "<id>"} or {"host", "token"} connects GitLab for the requesting
+profile: it adopts a login already on this machine (the ids /setup lists: this profile's env,
+another profile's .env, the gitlab-mr plugin's host, the glab CLI) or takes a typed pair, then
+writes the plugin's own settings — gitlab_host through the plugin-settings writer, gitlab_token
+through the .env credential route as OPERATIONS_GITLAB_TOKEN, never into config.yaml — and answers
+with the same probe. A token is never returned, logged, or put in an error message; a source with
+only a token is offered for the host this profile is already pointed at.
 
 Settings live in config.yaml under plugins.entries.operations.settings and are
 edited from Capabilities > Plugins in Hermes Desktop (see plugin.yaml).
@@ -168,6 +182,8 @@ KANBAN_ACTIVITY_KINDS = ("created", "completed", "crashed", "blocked", "timed_ou
 SEV_RANK = {"crit": 0, "warn": 1, "info": 2}
 CHANGES_LIMIT = 40
 MRS_LIMIT = 40
+# Merged MRs read for a window, 100 a page: enough for a busy week, and a flag says when it is not.
+MERGED_MAX = 500
 # Pool snapshots arrive about once a minute; a longer silence is the device being away,
 # not its models unloading, so the comparison restarts after it.
 POOL_GAP_MIN = 5
@@ -490,34 +506,232 @@ def _gitlab_token() -> str:
     return get_secret("OPERATIONS_GITLAB_TOKEN") or get_secret("GITLAB_TOKEN") or ""
 
 
+# GET answers are reused for this long; the page polls every 30 s and every 60 s, so a cache this
+# short keeps it current while collapsing the per-MR pipeline and job lookups onto one fetch each.
+GITLAB_CACHE_S = 30
+GITLAB_CACHE_MAX = 256
+_gitlab_cache: Dict[tuple, tuple] = {}
+
+
 def _gitlab(path: str, body: Optional[Dict[str, Any]] = None) -> str:
-    """GET, or POST with a JSON body (the rule proposal's only writes)."""
+    """GET, or POST with a JSON body (the rule proposal's only writes).
+
+    A GET is cached for GITLAB_CACHE_S: the Merge requests page asks for one MR's pipeline and jobs
+    per row, so two Desktops polling a 40-MR window spent ~160 requests a minute on the same
+    answers. A POST is never cached. A 429 is waited out once when GitLab says the wait is short,
+    and otherwise reported with its Retry-After, rather than hammering a rate limit.
+    """
     host, tok = _gitlab_host(), _gitlab_token()
     if not host or not tok:
         raise RuntimeError("no GitLab login: set GitLab host and GitLab token in the plugin's settings, or GITLAB_HOST and GITLAB_TOKEN")
+    key = (host, path)
+    if body is None:
+        hit = _gitlab_cache.get(key)
+        if hit is not None and time.time() - hit[0] < GITLAB_CACHE_S:
+            return hit[1]
     headers = {"PRIVATE-TOKEN": tok}
     if body is not None:
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(f"https://{host}/api/v4/{path}", headers=headers,
                                  data=None if body is None else json.dumps(body).encode("utf-8"))
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return resp.read().decode("utf-8")
+    for attempt in (0, 1):
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                text = resp.read().decode("utf-8")
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code != 429:
+                raise
+            wait = _retry_after(exc)
+            if attempt or wait is None or wait > 2:
+                raise RuntimeError("GitLab is rate limiting this token"
+                                   + (f"; retry after {wait:g}s" if wait is not None else ""))
+            time.sleep(wait)  # a short Retry-After: wait it out once instead of failing the page
+    else:  # both attempts raised and the last one was re-raised above
+        raise RuntimeError("GitLab did not answer")
+    if body is None:
+        if len(_gitlab_cache) >= GITLAB_CACHE_MAX:
+            _gitlab_cache.clear()  # a burst of distinct URLs: start over rather than grow forever
+        _gitlab_cache[key] = (time.time(), text)
+    return text
 
 
-def merged_mrs(since: float) -> List[Dict[str, Any]]:
-    qs = urllib.parse.urlencode({
-        "scope": "all", "state": "merged", "order_by": "updated_at", "sort": "desc", "per_page": "100",
-        "updated_after": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since))})
-    mrs = json.loads(_gitlab(f"merge_requests?{qs}"))
+# The setup checklist's look at GitLab: one GET /user, at most every GITLAB_PROBE_S, so a page that
+# re-reads /setup each minute does not spend a request on it each time.
+_GITLAB_PROBE: Dict[str, Any] = {"at": 0.0, "host": "", "value": None}
+GITLAB_PROBE_S = 300
+
+
+def gitlab_state(fresh: bool = False) -> Dict[str, Any]:
+    """{host, has_token, ok, user, error} for the setup checklist: is there a login, and does it answer?
+
+    The host and token are read every call (cheap, and they may just have been set); only the
+    network probe is cached. A missing login is reported without a request, since there is nothing
+    to ask with.
+    """
+    host, tok = _gitlab_host().strip(), _gitlab_token().strip()
+    out: Dict[str, Any] = {"host": host, "has_token": bool(tok), "ok": False, "user": None, "error": ""}
+    if not host or not tok:
+        out["error"] = "no GitLab host set" if not host else "no GitLab token set"
+        _GITLAB_PROBE.update(at=0.0, host="", value=None)
+        return out
+    cached = _GITLAB_PROBE["value"]
+    if (not fresh and cached and cached.get("host") == host
+            and time.time() - (_GITLAB_PROBE["at"] or 0) < GITLAB_PROBE_S):
+        return {**cached, "has_token": True}
+    try:
+        me = json.loads(_gitlab("user"))
+        out.update(ok=bool((me or {}).get("username")), user=(me or {}).get("username"))
+        if not out["ok"]:
+            out["error"] = "GitLab answered without a username"
+    except (RuntimeError, urllib.error.URLError, OSError, ValueError, KeyError) as exc:
+        out["error"] = (str(exc) or type(exc).__name__)[:200]
+    _GITLAB_PROBE.update(at=time.time(), host=host, value=dict(out))
+    return out
+
+
+GITLAB_SOURCES_MAX = 8
+_GITLAB_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?$")
+
+
+def _profile_name() -> str:
+    """The profile this dashboard request is running as ("default" for the root home)."""
+    return "default" if get_hermes_home() == get_default_hermes_root() else get_hermes_home().name
+
+
+def _env_logins(path: Path) -> Dict[str, str]:
+    """GITLAB_HOST / GITLAB_TOKEN out of one .env file. Values are kept: the caller decides what
+    to expose, and only an explicit "use this one" ever reads them."""
+    found: Dict[str, str] = {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return found
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key in ("GITLAB_HOST", "GITLAB_TOKEN", "OPERATIONS_GITLAB_TOKEN"):
+            found[key] = value.strip().strip('"').strip("'")
+    return found
+
+
+def _glab_login() -> Dict[str, str]:
+    """host + token from the glab CLI's own config, when it holds one."""
+    path = Path.home() / ".config" / "glab-cli" / "config.yml"
+    try:
+        data = safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, YAMLError):
+        return {}
+    hosts = data.get("hosts") if isinstance(data, dict) else None
+    if not isinstance(hosts, dict):
+        return {}
+    for host, cfg in hosts.items():
+        if not isinstance(cfg, dict):
+            continue
+        token = cfg.get("token") or cfg.get("api_token")
+        if token:
+            return {"host": str(host), "token": str(token)}
+    return {}
+
+
+def gitlab_logins() -> List[Dict[str, str]]:
+    """Every GitLab login this machine already holds, as ``{id, label, host, token}``.
+
+    What the Connect GitLab step can adopt without anyone pasting a token: this profile's own
+    environment, another profile's .env, the gitlab-mr plugin's settings (host only), and the glab
+    CLI. Only :func:`gitlab_sources` is exposed to the page, and it drops the token.
+    """
+    root = get_default_hermes_root()
+    out: List[Dict[str, str]] = []
+    # A source holding only a token (a profile .env with GITLAB_TOKEN and nothing else) is a login
+    # for the host this plugin is already pointed at, so that is the host it offers.
+    current = _gitlab_host()
+
+    def add(source_id: str, label: str, host: str, token: str) -> None:
+        host, token = (host or "").strip(), (token or "").strip()
+        if not host and token:
+            host = current
+        if not host and not token:
+            return
+        if any(o["host"] == host and o["token"] == token for o in out):
+            return
+        out.append({"id": source_id, "label": label, "host": host, "token": token})
+
+    add("env", "this profile's environment", get_secret("GITLAB_HOST") or "",
+        get_secret("OPERATIONS_GITLAB_TOKEN") or get_secret("GITLAB_TOKEN") or "")
+    for name in kanban_db.list_profiles_on_disk():
+        home = root if name == "default" else root / "profiles" / name
+        env = _env_logins(home / ".env")
+        if env:
+            add(f"profile:{name}", f"the {name} profile's .env", env.get("GITLAB_HOST", ""),
+                env.get("OPERATIONS_GITLAB_TOKEN") or env.get("GITLAB_TOKEN", ""))
+    # the gitlab-mr plugin is where a GitLab login usually already lives; it keeps the host in its
+    # settings and reads the token from GITLAB_TOKEN, so this source names a host, not a token
+    for name in dict.fromkeys((_profile_name(), "default")):
+        cfg = _profile_config(str(name))
+        try:
+            settings = safe_load(cfg.read_text(encoding="utf-8")) or {}
+        except (OSError, YAMLError):
+            continue
+        mr = ((((settings.get("plugins") or {}).get("entries") or {}).get("gitlab-mr") or {}).get("settings") or {})
+        if isinstance(mr, dict):
+            add("gitlab-mr", "the gitlab-mr plugin", str(mr.get("gitlab_host") or mr.get("host") or ""), "")
+            break
+    glab = _glab_login()
+    add("glab", "the glab CLI", glab.get("host", ""), glab.get("token", ""))
+    return out[:GITLAB_SOURCES_MAX]
+
+
+def gitlab_sources() -> List[Dict[str, Any]]:
+    """What the page may see: which logins exist, for which host, and whether a token is there."""
+    return [{"id": s["id"], "label": s["label"], "host": s["host"], "has_token": bool(s["token"])}
+            for s in gitlab_logins()]
+
+
+def _retry_after(exc: urllib.error.HTTPError) -> Optional[float]:
+    """Seconds a 429 asks us to wait, when it says so."""
+    raw = (exc.headers or {}).get("Retry-After") if getattr(exc, "headers", None) else None
+    try:
+        return max(0.0, float(raw)) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def merged_pages(since: float) -> tuple:
+    """``(rows, truncated)`` for MRs merged in the window, one page of 100 at a time up to MERGED_MAX.
+
+    A page that comes back short is the last one. A window busier than MERGED_MAX says so instead of
+    quietly counting the newest 500: the page can then show "the newest 500".
+    """
+    rows: List[Dict[str, Any]] = []
+    page = 1
+    while page <= MERGED_MAX // 100:
+        qs = urllib.parse.urlencode({
+            "scope": "all", "state": "merged", "order_by": "updated_at", "sort": "desc", "per_page": "100",
+            "page": str(page), "updated_after": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since))})
+        batch = json.loads(_gitlab(f"merge_requests?{qs}"))
+        rows.extend(batch)
+        if len(batch) < 100:
+            return rows, False
+        page += 1
+    return rows, True
+
+
+def merged_mrs(since: float) -> tuple:
+    """Merged MRs in the window as Activity rows, plus whether the window held more than were read."""
+    rows, truncated = merged_pages(since)
     out = []
-    for mr in mrs:
+    for mr in rows:
         ts = datetime.fromisoformat((mr.get("merged_at") or "").replace("Z", "+00:00")).timestamp() \
             if mr.get("merged_at") else None
         if ts is None or ts < since:
             continue
         out.append({"ts": ts, "kind": "merged", "text": mr["title"], "where": mr["references"]["full"],
-                    "url": mr["web_url"], "by": (mr.get("merged_by") or mr.get("author") or {}).get("username")})
-    return out
+                    "url": mr["web_url"], "by": (mr.get("merged_by") or (mr.get("author") or {})).get("username")})
+    return out, truncated
 
 
 def model_changes(m: sqlite3.Connection, since: float) -> List[Dict[str, Any]]:
@@ -575,8 +789,10 @@ def changes(hours: int = Query(24, ge=1, le=168)) -> Dict[str, Any]:
     since = now - hours * 3600
     items: List[Dict[str, Any]] = []
     errors: Dict[str, str] = {}
+    truncated = False
     try:
-        items += merged_mrs(since)
+        merged, truncated = merged_mrs(since)
+        items += merged
     except (RuntimeError, urllib.error.URLError, OSError, ValueError, KeyError) as exc:
         errors["gitlab"] = str(exc)
     m = _ro_or_empty(_METRICS_DB, _EMPTY_METRICS, errors, "models")
@@ -587,7 +803,8 @@ def changes(hours: int = Query(24, ge=1, le=168)) -> Dict[str, Any]:
     finally:
         m.close()
     items.sort(key=lambda i: -i["ts"])
-    return {"generated_at": now, "hours": hours, "items": items[:CHANGES_LIMIT], "errors": errors}
+    return {"generated_at": now, "hours": hours, "items": items[:CHANGES_LIMIT],
+            "truncated": truncated or len(items) > CHANGES_LIMIT, "errors": errors}
 
 
 
@@ -629,14 +846,17 @@ def merge_requests(hours: int = Query(24, ge=1, le=168)) -> Dict[str, Any]:
     since = now - hours * 3600
     errors: Dict[str, str] = {}
     items: List[Dict[str, Any]] = []
+    # one row past the limit, so "more than this" is a fact rather than a guess from a full page
     try:
-        base = {"scope": "all", "order_by": "updated_at", "sort": "desc", "per_page": str(MRS_LIMIT)}
+        base = {"scope": "all", "order_by": "updated_at", "sort": "desc", "per_page": str(MRS_LIMIT + 1)}
         opened = json.loads(_gitlab("merge_requests?" + urllib.parse.urlencode({**base, "state": "opened"})))
         merged = json.loads(_gitlab("merge_requests?" + urllib.parse.urlencode({
             **base, "state": "merged", "updated_after": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since))})))
     except (RuntimeError, urllib.error.URLError, OSError, ValueError, KeyError) as exc:
         return {"generated_at": now, "hours": hours, "items": [], "errors": {"gitlab": str(exc)}}
-    mrs = opened + [mr for mr in merged if (_iso(mr.get("merged_at")) or 0) >= since]
+    merged = [mr for mr in merged if (_iso(mr.get("merged_at")) or 0) >= since]
+    truncated = len(opened) > MRS_LIMIT or len(merged) > MRS_LIMIT
+    mrs = (opened[:MRS_LIMIT] + merged[:MRS_LIMIT])
     # one GitLab round trip per MR for its pipeline and one for its jobs; run them side by side
     with ThreadPoolExecutor(max_workers=8) as pool:
         # get_secret reads the profile from a context variable, which worker threads do not inherit
@@ -661,7 +881,10 @@ def merge_requests(hours: int = Query(24, ge=1, le=168)) -> Dict[str, Any]:
             "pipeline": pipe, "pipeline_unavailable": lost})
     if failed:
         errors["pipelines"] = f"{failed} of {len(mrs)} pipelines unavailable: {errors['pipelines']}"
-    return {"generated_at": now, "hours": hours, "items": items, "errors": errors}
+    return {"generated_at": now, "hours": hours, "items": items, "truncated": truncated,
+            "showing": {"open": min(len(opened), MRS_LIMIT), "merged": min(len(merged), MRS_LIMIT),
+                        "limit": MRS_LIMIT},
+            "errors": errors}
 
 
 def _served(device: Optional[str], provider: Optional[str], failed: bool) -> str:
@@ -1688,25 +1911,77 @@ def card_unblock(task_id: str, comment: str = Body("", embed=True)) -> Dict[str,
     return _start_now(out, task_id, profile) if profile else out
 
 
+def _start_limits(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """The dispatcher's config-driven caps, read the way it reads them."""
+    return {"max_spawn": kbd._positive_int(cfg.get("max_spawn"), None),
+            "max_in_progress": kbd.resolve_max_in_progress(kbd._positive_int(cfg.get("max_in_progress"), None)),
+            "max_in_progress_per_profile": kbd._positive_int(cfg.get("max_in_progress_per_profile"), None)}
+
+
+def _start_one_card(task_id: str, cfg: Dict[str, Any], limits: Dict[str, Any]) -> Optional[Any]:
+    """Start this card, and only this card, through the dispatcher's public one-card step.
+
+    hermes_cli.kanban_db_dispatch.start_task_once takes the board's own tick lock, applies the same
+    spawn budget, per-profile cap and guards a tick would, and claims and spawns only this card;
+    nothing else in ready is promoted, reclaimed or started. None when this Hermes predates it: then
+    dispatch_once is the only way to start a card and it ticks the whole board, so the caller falls
+    back to it and says which other cards that cost.
+    """
+    start = getattr(kbd, "start_task_once", None)
+    if start is None:
+        return None
+    with connect_closing(_KANBAN_DB) as k:
+        return start(k, task_id, max_spawn=limits["max_spawn"], max_in_progress=limits["max_in_progress"],
+                     max_in_progress_per_profile=limits["max_in_progress_per_profile"],
+                     default_assignee=(cfg.get("default_assignee") or "").strip() or None)
+
+
+def _tick_board(cfg: Dict[str, Any], limits: Dict[str, Any]) -> Any:
+    """One whole-board dispatcher tick, for a Hermes without start_task_once."""
+    with connect_closing(_KANBAN_DB) as k:
+        return kbd.dispatch_once(
+            k, default_assignee=(cfg.get("default_assignee") or "").strip() or None, **limits)
+
+
 def _start_now(out: Dict[str, Any], task_id: str, profile: str) -> Dict[str, Any]:
+    """Start this card's worker now, not the board's other ready cards with it.
+
+    A whole-board tick from a button starts whatever else is ready, up to a minute before the
+    gateway's own tick would: a card someone parked in ready can start because a different card
+    was handed to a profile. So this starts one card, through start_task_once. On a Hermes that
+    predates that function, it falls back to a tick and names every other card the tick started,
+    rather than
+    pretending only this one did.
+    """
     if out["status"] != "ready":
         return out
-    # One dispatcher tick now instead of waiting up to a minute for the gateway's; same
-    # config-driven limits as the gateway and `hermes kanban dispatch`.
     cfg = (load_config() or {}).get("kanban") or {}
-    with connect_closing(_KANBAN_DB) as k:
-        res = kbd.dispatch_once(
-            k,
-            max_spawn=kbd._positive_int(cfg.get("max_spawn"), None),
-            max_in_progress=kbd.resolve_max_in_progress(kbd._positive_int(cfg.get("max_in_progress"), None)),
-            default_assignee=(cfg.get("default_assignee") or "").strip() or None,
-            max_in_progress_per_profile=kbd._positive_int(cfg.get("max_in_progress_per_profile"), None))
+    limits = _start_limits(cfg)
+    out.update(started=False, also_started=[], warning="")
+    others: List[str] = []
+    res = _start_one_card(task_id, cfg, limits)
+    if res is None:
+        res = _tick_board(cfg, limits)
+        others = [t for t, _, _ in res.spawned if t != task_id]
+        out["also_started"] = others
     out["started"] = any(t == task_id for t, _, _ in res.spawned)
     busy = [n for t, _, n in res.skipped_per_profile_capped if t == task_id]
-    if out["started"] or res.skipped_locked:
+    guarded = [why for t, why in res.respawn_guarded if t == task_id]
+    if others:
+        out["warning"] = (f"Started {', '.join(others)} as well: this Hermes' dispatcher starts the"
+                          " whole board at once. Check those cards, or set kanban.max_spawn.")
+    elif out["started"] or res.skipped_locked:
         pass  # a locked tick means another dispatcher is mid-tick and claims it now
     elif busy:
         out["warning"] = f"{profile} is busy with {busy[0]} card(s); it starts this one when one finishes."
+    elif guarded:
+        out["warning"] = f"Hermes held this card back: {guarded[0]}"
+    elif getattr(res, "memory_pressure", "") in ("critical", "elevated"):
+        out["warning"] = (f"The host is under {res.memory_pressure} memory pressure, so no worker"
+                          " starts yet; the dispatcher starts it when there is room.")
+    elif task_id in getattr(res, "auto_blocked", []):
+        out["warning"] = (f"Starting it failed, so Hermes blocked the card with the reason on it;"
+                          " fix it on the Kanban page and hand it over again.")
     else:
         out["warning"] = f"{profile} did not start it yet; the Kanban page shows why."
         # Same probe the Kanban page uses; it fails open, so a warning is always real.
@@ -1717,6 +1992,13 @@ def _start_now(out: Dict[str, Any], task_id: str, profile: str) -> Dict[str, Any
                 out["warning"] = message
         except Exception:
             pass
+    try:  # the status the caller sees is the one the card is in now, not the one it had before
+        with connect_closing(_KANBAN_DB) as k:
+            card = kanban_db.get_task(k, task_id)
+            if card is not None:
+                out["status"] = card.status
+    except Exception:
+        pass
     return out
 
 
@@ -2360,6 +2642,8 @@ def propose_rule(kind: str = Body(..., embed=True), rule: Dict[str, Any] = Body(
     the file. With to="org" (business mode) the rule goes to the organisation's copy of the
     standard instead, see propose_to_org.
     """
+    if to == "org" and not BUSINESS_MODE:
+        _require_business("Proposing a rule to the organisation")
     project = _project()
     if kind not in ("host_rules", "repo_rules"):
         raise HTTPException(400, "kind must be host_rules or repo_rules")
@@ -2427,7 +2711,17 @@ def propose_rule(kind: str = Body(..., embed=True), rule: Dict[str, Any] = Body(
 # whether it publishes or waits for an admin, and the page shows what it answered.
 ORG_CHECK_S = 300
 BUSINESS_MODE = False   # off until business mode is finished: always single, even in an org with sync on
+# Role views and their editor are a business feature too, and off with it. desktop/plugin.js gates
+# the picker and the editor on VIEW_AS; this gates the endpoints that write, so an API call cannot
+# save a role list the page has no way to show or edit (the read stays open: the page lists them).
+ROLE_EDITING = BUSINESS_MODE
 _org_cache: Dict[str, Any] = {"at": 0.0, "value": None}
+
+
+def _require_business(what: str) -> None:
+    """403 for a feature that is off in this version, rather than doing half of it."""
+    if not BUSINESS_MODE:
+        raise HTTPException(403, f"{what} is a business feature and is not available yet")
 
 
 def org_mode(fresh: bool = False) -> Dict[str, Any]:
@@ -2495,7 +2789,7 @@ def propose_to_org(kind: str, rule: Dict[str, Any], repo_text: str, repo_std: Di
     """
     org = org_mode(fresh=True)
     if org["mode"] != "business":
-        raise HTTPException(409, f"business mode is off: {org['reason']}")
+        raise HTTPException(403, f"This is a business feature and is not available yet: {org['reason']}")
     name = str(repo_std.get("standard") or "")
     if not _RULE_ID.fullmatch(name):
         raise HTTPException(409, "the standard has no `standard:` name to share it under")
@@ -2620,6 +2914,8 @@ def roles_get() -> Dict[str, Any]:
 @router.put("/roles")
 def roles_put(roles: List[Any] = Body(..., embed=True)) -> Dict[str, Any]:
     """Save this install's roles. The page sends the whole list; the built-in ones are the reset."""
+    if not ROLE_EDITING:
+        raise HTTPException(403, "Editing roles is a business feature and is not available yet")
     if not roles or len(roles) > ROLES_MAX:
         raise HTTPException(400, f"between 1 and {ROLES_MAX} roles")
     clean = [_clean_role(r) for r in roles]
@@ -2635,6 +2931,8 @@ def roles_put(roles: List[Any] = Body(..., embed=True)) -> Dict[str, Any]:
 @router.delete("/roles")
 def roles_reset() -> Dict[str, Any]:
     """Back to the built-in roles."""
+    if not ROLE_EDITING:
+        raise HTTPException(403, "Editing roles is a business feature and is not available yet")
     _ROLES.unlink(missing_ok=True)
     return {"roles": ROLE_DEFAULTS, "defaults": ROLE_DEFAULTS, "saved": False, "errors": {}}
 
@@ -2668,10 +2966,56 @@ def setup() -> Dict[str, Any]:
     action = s.get("drift_action") if s.get("drift_action") in DRIFT_ACTIONS else "button"
     return {"profiles": profile_states(), "metrics": _METRICS_DB.exists(), "kanban": _KANBAN_DB.exists(),
             "conformance_project": _standard_project(),
+            "gitlab": {**gitlab_state(), "sources": gitlab_sources()},
             "alert_target": (s.get("alert_target") or "").strip(),
             "drift_action": action, "drift_profile": (s.get("drift_profile") or "").strip(),
             "profile": "default" if get_hermes_home() == get_default_hermes_root() else get_hermes_home().name,
             "settings_page": (get_hermes_home() / "plugins" / ID).is_dir(),
-            "from_default": sorted(k for k in ("conformance_project", "alert_target", "drift_action", "drift_profile")
-                                   if k in s and k not in own)}
+            "from_default": sorted(k for k in ("conformance_project", "gitlab_host", "alert_target", "drift_action",
+                                               "drift_profile") if k in s and k not in own)}
+
+
+@router.post("/setup/gitlab")
+def setup_gitlab(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """Connect GitLab for this profile, from a login already on the machine or from what the page typed.
+
+    Body: ``{"source": "<id>"}`` adopts one of the logins GET /setup lists (id, host, has_token; the
+    token itself is never sent to the page), or ``{"host": ..., "token": ...}`` takes the pair. Either
+    way the result is written where Hermes keeps these settings, not somewhere of this plugin's
+    choosing: the host through the plugin-settings writer (``plugins.entries.operations.settings``),
+    the token through the .env credential route under the name ``plugin.yaml`` declares
+    (``OPERATIONS_GITLAB_TOKEN``), never into config.yaml and never into plugin-data. The token is
+    never returned, logged, or put in an error message; the answer is the same probe GET /setup gives.
+    """
+    wanted = str(body.get("source") or "").strip()
+    host = str(body.get("host") or "").strip()
+    token = str(body.get("token") or "").strip()
+    if wanted:
+        chosen = next((s for s in gitlab_logins() if s["id"] == wanted), None)
+        if chosen is None:
+            raise HTTPException(404, f"no GitLab login named {wanted!r} on this machine")
+        host, token = chosen["host"], chosen["token"]
+        if not host or not token:
+            raise HTTPException(409, f"{chosen['label']} has no token to use; connect it with a token instead")
+    if not host or not token:
+        raise HTTPException(400, "the GitLab host and a token are both needed")
+    if not _GITLAB_HOST_RE.match(host):
+        raise HTTPException(400, "the GitLab host looks wrong; expected something like gitlab.example.com")
+    try:
+        from hermes_cli.config_env_routing import save_env_setting
+        from hermes_cli.plugins_settings import secret_env_name, save_plugin_settings
+    except ImportError as exc:  # an older Hermes: say so rather than writing config by hand
+        raise HTTPException(503, f"this Hermes cannot save plugin settings ({exc}); "
+                                 "set plugins.entries.operations.settings.gitlab_host yourself")
+    plugin_dir = Path(__file__).resolve().parent.parent
+    try:
+        save_plugin_settings(ID, plugin_dir, {"gitlab_host": host})
+        spec = {"env": "OPERATIONS_GITLAB_TOKEN"}
+        save_env_setting(secret_env_name(ID, "gitlab_token", spec), token)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except PermissionError as exc:
+        raise HTTPException(403, f"this profile's settings are managed elsewhere: {exc}")
+    _GITLAB_PROBE.update(at=0.0, host="", value=None)  # the login changed: probe it again
+    return {"gitlab": gitlab_state(fresh=True), "wrote": ["gitlab_host", "gitlab_token"]}
 
