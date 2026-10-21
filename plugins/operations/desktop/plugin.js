@@ -673,7 +673,7 @@ const roleBrief = (role, d, tail) => [
 // What a chat is told to turn on rolectl-mcp, with its writes, for one profile (a from /models/agents).
 const rolectlBrief = a => [
   "Hermes Operations: no profile can change the model router's roles, so a role left with no loaded model has to be fixed by hand.",
-  a.rolectl_mcp ? '' : 'rolectl-mcp.py, which the model router installs, is not in ~/.hermes/bin. Find it on this machine first; if it is not here, stop and say so.',
+  a.rolectl_mcp ? '' : 'This install has no rolectl-mcp, so nothing here can change router roles from a chat. Do not invent one and do not guess a path: say the router in use has no rolectl and stop.',
   `Turn it on for the ${a.profile} profile: in its config.yaml, add this under mcp_servers. Keep a copy of the file first and change nothing else.`, '',
   '  rolectl:', '    command: python3', `    args: [${a.rolectl_mcp || '<path to rolectl-mcp.py>'}]`, '    env:', '      ROLECTL_MCP_ALLOW_WRITE: "1"', '',
   'Then tell me what loads it (a new session or a gateway restart). If a step needs me, stop and say what.'
@@ -3022,7 +3022,7 @@ function topoIssues(data, now) {
                cause: `The ${g.platform} gateway on ${g.host} is ${g.state}, so messages sent to it are not answered.`,
                facts: g.error ? [`Last error: ${g.error}`] : [],
                go: [['See its traffic', 'flow', `entry:${g.platform.split(':').at(-1)}`]],
-               cmd: { text: '~/.hermes/hermes-agent/.venv/bin/hermes -p default gateway restart', note: `Run on ${g.host} once the cause is fixed. It restarts the gateway for every profile.` } })
+               cmd: { text: 'hermes gateway restart', note: `Run on ${g.host} once the cause is fixed. It restarts the gateway service, which serves every profile.` } })
   }
   for (const s of data.served.filter(s => s.pool_device && !s.live))
     out.push({ key: `s:${s.id}`, tone: 'bad', since: since(`s:${s.id}`), nodes: [`s:${s.id}`], text: `${s.id} offline${dur(`s:${s.id}`)}`,
@@ -5060,7 +5060,9 @@ function rolectlToast(ctx) {
     if (ctx.storage.get(ROLECTL_TOASTED, '') === today) return
     ctx.rest('/models/agents').then(a => {
       ctx.storage.set(ROLECTL_TOASTED, today)
-      if (!a.router || Object.keys(a.profiles).length) return
+      // no rolectl-mcp on this machine means there is nothing here for the user to turn on:
+      // the router in use is not the one this advice is about, so say nothing
+      if (!a.router || !a.rolectl_mcp || Object.keys(a.profiles).length) return
       host.notify({ kind: 'info', title: 'Operations can do more', message: 'No profile can fix model router roles.',
                     detail: 'With rolectl-mcp on and its writes allowed, a chat or a kanban card can bring back a role that has no loaded model.',
                     action: canChat() ? { label: 'Fix in a chat', onClick: () => fixRolectl(a) } : { label: 'Open Operations', onClick: () => host.navigate(PATH) } })

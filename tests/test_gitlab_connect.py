@@ -25,22 +25,22 @@ class GitlabConnectTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         (self.root / "config.yaml").write_text("plugins:\n  enabled: [operations]\n")
-        for name in ("default", "cpompa-ai-cloud"):
+        for name in ("default", "beta-cloud"):
             home = self.root if name == "default" else self.root / "profiles" / name
             home.mkdir(parents=True, exist_ok=True)
-        (self.root / "profiles" / "cpompa-ai-cloud" / ".env").write_text(
-            "GITLAB_HOST=gitlab.cpompa.com\nGITLAB_TOKEN=glpat-from-that-profile\n")
-        self.secret = {"GITLAB_HOST": "gitlab.cpompa.com", "GITLAB_TOKEN": "glpat-here"}
+        (self.root / "profiles" / "beta-cloud" / ".env").write_text(
+            "GITLAB_HOST=gitlab.example.com\nGITLAB_TOKEN=glpat-from-that-profile\n")
+        self.secret = {"GITLAB_HOST": "gitlab.example.com", "GITLAB_TOKEN": "glpat-here"}
         self.wrote, self.env_wrote = [], []
         patches = [
             mock.patch.object(api, "get_default_hermes_root", lambda: self.root),
             mock.patch.object(api, "get_hermes_home", lambda: self.root),
-            mock.patch.object(api.kanban_db, "list_profiles_on_disk", lambda: ["cpompa-ai-cloud", "default"]),
+            mock.patch.object(api.kanban_db, "list_profiles_on_disk", lambda: ["beta-cloud", "default"]),
             mock.patch.object(api, "get_secret", lambda name: self.secret.get(name, "")),
             mock.patch.object(api, "_glab_login", lambda: {}),
-            mock.patch.object(api, "gitlab_state", lambda fresh=False: {"host": "gitlab.cpompa.com",
+            mock.patch.object(api, "gitlab_state", lambda fresh=False: {"host": "gitlab.example.com",
                                                                        "has_token": True, "ok": True,
-                                                                       "user": "cpompa", "error": ""}),
+                                                                       "user": "someone", "error": ""}),
             mock.patch("hermes_cli.plugins_settings.save_plugin_settings",
                        lambda pid, d, values: (self.wrote.append(values), list(values))[1]),
             mock.patch("hermes_cli.config_env_routing.save_env_setting",
@@ -57,35 +57,35 @@ class GitlabConnectTest(unittest.TestCase):
         sources = api.gitlab_sources()
         ids = [s["id"] for s in sources]
         self.assertIn("env", ids)
-        self.assertIn("profile:cpompa-ai-cloud", ids)
+        self.assertIn("profile:beta-cloud", ids)
         self.assertTrue(all("token" not in s for s in sources))
         self.assertEqual([s for s in sources if s["id"] == "env"][0],
                          {"id": "env", "label": "this profile's environment",
-                          "host": "gitlab.cpompa.com", "has_token": True})
+                          "host": "gitlab.example.com", "has_token": True})
         # the JSON the page receives is the same, token-free
         self.assertNotIn("glpat", json.dumps(api.setup()))
 
     def test_a_host_with_no_token_is_still_named_as_a_source(self):
         self.secret = {}
-        (self.root / "profiles" / "cpompa-ai-cloud" / ".env").write_text("")
+        (self.root / "profiles" / "beta-cloud" / ".env").write_text("")
         (self.root / "config.yaml").write_text(
-            "plugins:\n  entries:\n    gitlab-mr:\n      settings:\n        gitlab_host: gitlab.cpompa.com\n")
+            "plugins:\n  entries:\n    gitlab-mr:\n      settings:\n        gitlab_host: gitlab.example.com\n")
         self.assertEqual(api.gitlab_sources(), [{"id": "gitlab-mr", "label": "the gitlab-mr plugin",
-                                                 "host": "gitlab.cpompa.com", "has_token": False}])
+                                                 "host": "gitlab.example.com", "has_token": False}])
 
     def test_a_token_only_source_is_offered_for_the_host_already_configured(self):
         # this is the common case on a fleet: a profile .env with a token and no host, and the
         # plugin already pointed at one
         self.secret = {}
-        (self.root / "profiles" / "cpompa-ai-cloud" / ".env").write_text("GITLAB_TOKEN=glpat-only\n")
-        with mock.patch.object(api, "_gitlab_host", lambda: "gitlab.cpompa.com"):
+        (self.root / "profiles" / "beta-cloud" / ".env").write_text("GITLAB_TOKEN=glpat-only\n")
+        with mock.patch.object(api, "_gitlab_host", lambda: "gitlab.example.com"):
             sources = api.gitlab_sources()
-        self.assertEqual([s["host"] for s in sources], ["gitlab.cpompa.com"])
+        self.assertEqual([s["host"] for s in sources], ["gitlab.example.com"])
         self.assertTrue(sources[0]["has_token"])
 
     def test_using_a_source_writes_the_plugins_own_settings(self):
-        out = api.setup_gitlab({"source": "profile:cpompa-ai-cloud"})
-        self.assertEqual(self.wrote, [{"gitlab_host": "gitlab.cpompa.com"}])
+        out = api.setup_gitlab({"source": "profile:beta-cloud"})
+        self.assertEqual(self.wrote, [{"gitlab_host": "gitlab.example.com"}])
         self.assertEqual(self.env_wrote, [("OPERATIONS_GITLAB_TOKEN", "glpat-from-that-profile")])
         self.assertEqual(out["wrote"], ["gitlab_host", "gitlab_token"])
         self.assertTrue(out["gitlab"]["ok"])
@@ -100,9 +100,9 @@ class GitlabConnectTest(unittest.TestCase):
     def test_refusals(self):
         # a source with a host and no token exists, so "adopt it" can be refused for the right reason
         (self.root / "config.yaml").write_text(
-            "plugins:\n  entries:\n    gitlab-mr:\n      settings:\n        gitlab_host: gitlab.cpompa.com\n")
+            "plugins:\n  entries:\n    gitlab-mr:\n      settings:\n        gitlab_host: gitlab.example.com\n")
         self.secret = {}
-        (self.root / "profiles" / "cpompa-ai-cloud" / ".env").write_text("")
+        (self.root / "profiles" / "beta-cloud" / ".env").write_text("")
         cases = [
             ({"source": "nobody"}, 404),
             ({"source": "gitlab-mr"}, 409),          # a host but no token: not adoptable
@@ -135,7 +135,7 @@ class PluginCopyTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self.own = self.root / "profiles" / "gamedev-s2" / "plugins" / "operations"
+        self.own = self.root / "profiles" / "gamma-lab" / "plugins" / "operations"
         self.shared = self.root / "plugins" / "operations"
 
     def tearDown(self):
@@ -150,12 +150,12 @@ class PluginCopyTest(unittest.TestCase):
         self.copy_of("0.3.0", self.shared)
         with mock.patch.object(api, "get_default_hermes_root", lambda: self.root), \
              mock.patch.object(api, "__file__", str(self.own / "dashboard" / "plugin_api.py")), \
-             mock.patch.object(api, "_profile_name", lambda: "gamedev-s2"):
+             mock.patch.object(api, "_profile_name", lambda: "gamma-lab"):
             out = api.plugin_copy()
         self.assertEqual((out["page"], out["shared"]), ("0.1.0", "0.3.0"))
         self.assertTrue(out["stale"])
         self.assertFalse(out["newer"])
-        self.assertIn("hermes -p gamedev-s2 plugins update operations", out["hint"])
+        self.assertIn("hermes -p gamma-lab plugins update operations", out["hint"])
 
     def test_the_shared_install_serving_default_is_not_stale(self):
         self.copy_of("0.3.0", self.shared)
@@ -182,7 +182,7 @@ class PluginCopyTest(unittest.TestCase):
         self.copy_of("0.3.0", self.own)
         with mock.patch.object(api, "get_default_hermes_root", lambda: self.root), \
              mock.patch.object(api, "__file__", str(self.own / "dashboard" / "plugin_api.py")), \
-             mock.patch.object(api, "_profile_name", lambda: "gamedev-s2"):
+             mock.patch.object(api, "_profile_name", lambda: "gamma-lab"):
             out = api.plugin_copy()
         self.assertEqual((out["page"], out["shared"]), ("0.3.0", None))
         self.assertFalse(out["stale"])
@@ -192,7 +192,7 @@ class PluginCopyTest(unittest.TestCase):
         self.copy_of("0.3.0", self.shared)
         with mock.patch.object(api, "get_default_hermes_root", lambda: self.root), \
              mock.patch.object(api, "__file__", str(self.own / "dashboard" / "plugin_api.py")), \
-             mock.patch.object(api, "_profile_name", lambda: "gamedev-s2"), \
+             mock.patch.object(api, "_profile_name", lambda: "gamma-lab"), \
              mock.patch.object(api, "profile_states", lambda: []), \
              mock.patch.object(api, "_standard_project", lambda: ""), \
              mock.patch.object(api, "gitlab_sources", lambda: []), \

@@ -25,7 +25,7 @@ class HandoffLanesTest(unittest.TestCase):
     def test_open_card_from_before_the_window_is_clipped_to_it(self):
         since = NOW - 6 * HOUR
         items = [
-            {"id": "old", "kind": "card", "from": "claude-code", "to": "backend-eng", "title": "old", "open": True,
+            {"id": "old", "kind": "card", "from": "claude-code", "to": "alpha-eng", "title": "old", "open": True,
              "status": "ready", "start": NOW - 19 * HOUR, "end": None,
              "runs": [{"start": NOW - 18 * HOUR, "end": NOW - 17 * HOUR}, {"start": NOW - 2 * HOUR, "end": None}]},
             {"id": "new", "kind": "subagent", "from": "coder", "to": "subagent", "title": "new", "open": False,

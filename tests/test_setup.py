@@ -76,7 +76,7 @@ class SetupRouteTest(unittest.TestCase):
 
     def test_gitlab_host_from_default_is_named(self):
         entries = ("plugins:\n  entries:\n    operations:\n      settings:\n"
-                   "        gitlab_host: gitlab.cpompa.com\n")
+                   "        gitlab_host: gitlab.example.com\n")
         (self.root / "config.yaml").write_text(entries)
         (self.root / "profiles" / "b" / "config.yaml").write_text("plugins:\n  enabled: [operations]\n")
         with mock.patch.object(api, "get_hermes_home", lambda: self.root / "profiles" / "b"), \
@@ -192,7 +192,7 @@ console.log(JSON.stringify({ left: steps.filter(x => !x.done).map(x => x.id), to
                              steps: Object.fromEntries(steps.map(x => [x.id, x])),
                              copies: [
                                copyNote({ page: '0.1.0', shared: '0.3.0', stale: true, newer: false,
-                                          hint: 'run hermes -p gamedev-s2 plugins update operations, then restart Hermes Desktop' }),
+                                          hint: 'run hermes -p gamma-lab plugins update operations, then restart Hermes Desktop' }),
                                copyNote({ page: '0.3.0', shared: '0.3.0', stale: false, newer: false, hint: '' }),
                                copyNote({ page: '0.10.0', shared: '0.9.0', stale: false, newer: true, hint: '' }),
                                copyNote(null), copyNote({ page: '0.3.0', shared: null }),
@@ -225,28 +225,28 @@ class ChecklistTest(unittest.TestCase):
         # a stale copy names both versions and the command that fixes it, not just "update"
         self.assertIn("0.1.0", notes[0])
         self.assertIn("0.3.0", notes[0])
-        self.assertIn("hermes -p gamedev-s2 plugins update operations", notes[0])
+        self.assertIn("hermes -p gamma-lab plugins update operations", notes[0])
         self.assertIsNone(notes[1])                       # same version: nothing to say
         self.assertIn("newer than the shared install", notes[2])
         self.assertIsNone(notes[3])                       # no data yet
         self.assertIsNone(notes[4])                       # no shared install to compare against
 
     def test_the_profile_step_is_about_this_profile_and_names_the_others(self):
-        on = self.run_js({**FRESH, "profile": "backend-eng", "profiles": [
-            {"profile": "default", "state": "on"}, {"profile": "backend-eng", "state": "on"},
+        on = self.run_js({**FRESH, "profile": "alpha-eng", "profiles": [
+            {"profile": "default", "state": "on"}, {"profile": "alpha-eng", "state": "on"},
             {"profile": "writer", "state": "missing"}]})["steps"]["profiles"]
         self.assertTrue(on["done"])
         self.assertIn("On in 2 of 3 profiles", on["text"])
         self.assertIn("Not on in writer", on["text"])
-        off = self.run_js({**FRESH, "profile": "backend-eng", "profiles": [
-            {"profile": "backend-eng", "state": "off"}]})["steps"]["profiles"]
+        off = self.run_js({**FRESH, "profile": "alpha-eng", "profiles": [
+            {"profile": "alpha-eng", "state": "off"}]})["steps"]["profiles"]
         self.assertFalse(off["done"])
         self.assertIn("plugins: disabled", off["text"])
 
     def test_done_install_has_nothing_left_and_no_toast(self):
         done = {**FRESH, "profiles": [{"profile": "default", "state": "on"}, {"profile": "b", "state": "off"}],
                 "metrics": True, "conformance_project": "g/std", "drift_action": "button",
-                "gitlab": {"host": "gitlab.cpompa.com", "has_token": True, "ok": True, "user": "cpompa", "error": ""}}
+                "gitlab": {"host": "gitlab.example.com", "has_token": True, "ok": True, "user": "someone", "error": ""}}
         out = self.run_js(done)
         self.assertEqual((out["left"], out["toasts"]), ([], []))
 
@@ -258,8 +258,8 @@ class ChecklistTest(unittest.TestCase):
         self.assertIn("hermes -p coder config set plugins.entries.operations.settings.gitlab_token", step["text"])
         self.assertEqual(step["action"]["label"], "Copy command")
         # a host answering is done, and says so by name
-        step = self.run_js({**FRESH, "gitlab": {"host": "gitlab.x", "has_token": True, "ok": True, "user": "cpompa", "error": ""}})["gitlab"]
-        self.assertEqual((step["done"], step["text"]), (True, "Connected to gitlab.x as cpompa."))
+        step = self.run_js({**FRESH, "gitlab": {"host": "gitlab.x", "has_token": True, "ok": True, "user": "someone", "error": ""}})["gitlab"]
+        self.assertEqual((step["done"], step["text"]), (True, "Connected to gitlab.x as someone."))
         self.assertIsNone(step["action"])
         # a host that is set but silent is not done, and its error is shown rather than a spinner
         step = self.run_js({**FRESH, "gitlab": {"host": "gitlab.x", "has_token": True, "ok": False, "user": None, "error": "timed out"}})["gitlab"]
@@ -270,22 +270,22 @@ class ChecklistTest(unittest.TestCase):
         # a complete source for another host, and one for the host the plugin is pointed at:
         # the matching one wins, so pressing it cannot quietly move the plugin to another GitLab
         step = self.run_js({**FRESH, "gitlab": {
-            "host": "gitlab.cpompa.com", "has_token": False, "ok": False, "user": None, "error": "no GitLab token set",
+            "host": "gitlab.example.com", "has_token": False, "ok": False, "user": None, "error": "no GitLab token set",
             "sources": [{"id": "glab", "label": "the glab CLI", "host": "gitlab.other", "has_token": True},
-                        {"id": "profile:ops", "label": "the ops profile's .env", "host": "gitlab.cpompa.com", "has_token": True}],
+                        {"id": "profile:ops", "label": "the ops profile's .env", "host": "gitlab.example.com", "has_token": True}],
         }})["gitlab"]
         self.assertEqual(step["connect"]["source"], "profile:ops")
         self.assertEqual(step["connect"]["label"], "the ops profile's .env")
-        self.assertEqual(step["connect"]["host"], "gitlab.cpompa.com")
+        self.assertEqual(step["connect"]["host"], "gitlab.example.com")
 
     def test_the_gitlab_step_offers_no_adoption_without_a_token_anywhere(self):
         step = self.run_js({**FRESH, "gitlab": {
-            "host": "gitlab.cpompa.com", "has_token": False, "ok": False, "user": None, "error": "no GitLab token set",
-            "sources": [{"id": "gitlab-mr", "label": "the gitlab-mr plugin", "host": "gitlab.cpompa.com", "has_token": False}],
+            "host": "gitlab.example.com", "has_token": False, "ok": False, "user": None, "error": "no GitLab token set",
+            "sources": [{"id": "gitlab-mr", "label": "the gitlab-mr plugin", "host": "gitlab.example.com", "has_token": False}],
         }})["gitlab"]
         # the host is prefilled for typing a token, but nothing claims to be adoptable
         self.assertIsNone(step["connect"]["source"])
-        self.assertEqual(step["connect"]["host"], "gitlab.cpompa.com")
+        self.assertEqual(step["connect"]["host"], "gitlab.example.com")
         self.assertEqual(step["connect"]["sources"], 1)
 
     def test_without_a_settings_form_a_step_gives_the_command_and_copies_it(self):
@@ -304,7 +304,7 @@ class GitlabStateTest(unittest.TestCase):
 
     def setUp(self):
         self.calls = []
-        patches = [mock.patch.object(api, "_gitlab_host", lambda: "gitlab.cpompa.com"),
+        patches = [mock.patch.object(api, "_gitlab_host", lambda: "gitlab.example.com"),
                    mock.patch.object(api, "_gitlab_token", lambda: "tok")]
         for p in patches:
             p.start()
@@ -330,15 +330,15 @@ class GitlabStateTest(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
     def test_a_login_that_answers_is_ok_and_cached_for_the_ttl(self):
-        with self.probe({"username": "cpompa"}):
+        with self.probe({"username": "someone"}):
             first = api.gitlab_state()
             again = api.gitlab_state()
             fresh = api.gitlab_state(fresh=True)
-        self.assertEqual((first["ok"], first["user"]), (True, "cpompa"))
-        self.assertEqual(again["user"], "cpompa")
+        self.assertEqual((first["ok"], first["user"]), (True, "someone"))
+        self.assertEqual(again["user"], "someone")
         self.assertEqual(len(self.calls), 2)  # the cached read, then the fresh one
         later = time.time() + api.GITLAB_PROBE_S + 1
-        with mock.patch.object(api.time, "time", lambda: later), self.probe({"username": "cpompa"}):
+        with mock.patch.object(api.time, "time", lambda: later), self.probe({"username": "someone"}):
             api.gitlab_state()
         self.assertEqual(len(self.calls), 3)
 

@@ -146,9 +146,9 @@ class GitlabClientTest(unittest.TestCase):
         return urllib.error.HTTPError("https://gitlab.x/api/v4/user", 429, "Too Many Requests", headers, None)
 
     def test_a_get_is_reused_for_the_ttl_and_a_post_never_is(self):
-        with self.serve('{"username": "cpompa"}'):
-            self.assertEqual(api._gitlab("user"), '{"username": "cpompa"}')
-            self.assertEqual(api._gitlab("user"), '{"username": "cpompa"}')
+        with self.serve('{"username": "someone"}'):
+            self.assertEqual(api._gitlab("user"), '{"username": "someone"}')
+            self.assertEqual(api._gitlab("user"), '{"username": "someone"}')
             self.assertEqual(len(self.calls), 1)  # the second read came from the cache
         # a write is a POST and must always reach GitLab
         with self.serve('{"ok": true}'):
@@ -164,8 +164,8 @@ class GitlabClientTest(unittest.TestCase):
         self.assertEqual(len(self.calls), 2)
 
     def test_a_short_rate_limit_is_waited_out_once(self):
-        with mock.patch.object(api.time, "sleep") as sleep, self.serve(self.too_many(1), '{"username": "cpompa"}'):
-            self.assertEqual(api._gitlab("user"), '{"username": "cpompa"}')
+        with mock.patch.object(api.time, "sleep") as sleep, self.serve(self.too_many(1), '{"username": "someone"}'):
+            self.assertEqual(api._gitlab("user"), '{"username": "someone"}')
         sleep.assert_called_once_with(1.0)
         self.assertEqual(len(self.calls), 2)
 

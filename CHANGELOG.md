@@ -6,6 +6,32 @@ The plugin's version lives in three places that must agree: `plugins/operations/
 version below has no section here, so `hermes plugins update` and the catalogue can always say
 which build an install is on.
 
+## 0.3.2
+
+**Nothing of the author's fleet ships to anyone else.** Every install was getting this machine's
+environment in three places:
+
+- the catalogue screenshots were shots of a real fleet — hostnames, profile names, local model
+  names, role aliases, and the conformance standard's project, commit and dates. The two that
+  carried them (Topology, Conformance) are gone until they are retaken from demo data; the listing
+  keeps the Overview shot, which carries only numbers
+- the published tests used real profile names and this GitLab's hostname as fixtures; they are now
+  `alpha-eng`, `beta-cloud`, `gamma-lab`, `delta-harness` and `gitlab.example.com`
+- a repair command told people to run the source-install venv binary with `-p default`: an install
+  path that only exists on a source install, and a profile that may not exist. It reads
+  `hermes gateway restart` now
+
+**The rolectl-mcp advice is gated on having it.** The once-a-day "Operations can do more" toast
+fired whenever no profile could fix router roles, so an install running a different router was told
+to enable a helper it does not have — and the chat brief sent it hunting for the file. Both are
+gated on `GET /models/agents` reporting the path; without it the brief says this router has no
+rolectl instead of guessing.
+
+`ci/no_personal_data.sh` (CI job `no-personal-data`) now fails the build on a home path, machine
+name, tailnet address, our profile names, this GitLab's hostname or a source-install path in
+anything under `plugins/` or `tests/`. AGENTS.md says the same, plus the rule CI cannot enforce:
+screenshots come from demo data, or the view gets no screenshot.
+
 ## 0.3.1
 
 **A page that is older than its plugin now says so.** A profile with its own copy under

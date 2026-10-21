@@ -36,11 +36,11 @@ class HandoffsTest(unittest.TestCase):
 CREATE TABLE tasks (id TEXT, title TEXT, assignee TEXT, status TEXT, created_at INTEGER, created_by TEXT, completed_at INTEGER);
 CREATE TABLE task_runs (task_id TEXT, profile TEXT, started_at INTEGER, ended_at INTEGER, outcome TEXT, error TEXT);
 """)
-        k.execute("INSERT INTO tasks VALUES ('t1', 'Ship it', 'backend-eng', 'done', ?, 'cloud', ?)", (NOW - 7200, NOW - 3600))
+        k.execute("INSERT INTO tasks VALUES ('t1', 'Ship it', 'alpha-eng', 'done', ?, 'cloud', ?)", (NOW - 7200, NOW - 3600))
         k.execute("INSERT INTO tasks VALUES ('t2', 'Old open', NULL, 'ready', ?, 'cloud', NULL)", (NOW - 9000000,))
         k.execute("INSERT INTO tasks VALUES ('t3', 'Old done', 'writer', 'done', ?, 'cloud', ?)", (NOW - 9000000, NOW - 8000000))
-        k.execute("INSERT INTO task_runs VALUES ('t1', 'backend-eng', ?, ?, 'crashed', ?)", (NOW - 7000, NOW - 6000, "x" * 500))
-        k.execute("INSERT INTO task_runs VALUES ('t1', 'backend-eng', ?, ?, 'completed', NULL)", (NOW - 5000, NOW - 3600))
+        k.execute("INSERT INTO task_runs VALUES ('t1', 'alpha-eng', ?, ?, 'crashed', ?)", (NOW - 7000, NOW - 6000, "x" * 500))
+        k.execute("INSERT INTO task_runs VALUES ('t1', 'alpha-eng', ?, ?, 'completed', NULL)", (NOW - 5000, NOW - 3600))
         k.commit()
         k.close()
         self.saved = api._METRICS_DB, api._KANBAN_DB
@@ -70,7 +70,7 @@ CREATE TABLE task_runs (task_id TEXT, profile TEXT, started_at INTEGER, ended_at
     def test_pairs_put_open_work_first(self):
         pairs = api.handoffs_route(24)["pairs"]
         self.assertEqual([(p["from"], p["to"], p["count"], p["open"]) for p in pairs],
-                         [("cloud", "unassigned", 1, 1), ("coder", "subagent", 2, 0), ("cloud", "backend-eng", 1, 0)])
+                         [("cloud", "unassigned", 1, 1), ("coder", "subagent", 2, 0), ("cloud", "alpha-eng", 1, 0)])
 
     def test_older_metrics_without_profile_and_missing_kanban(self):
         m = sqlite3.connect(self.metrics)
