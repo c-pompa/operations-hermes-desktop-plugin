@@ -37,6 +37,12 @@ Links on every page open the same host, model, card or session on another page, 
 
 ## Install
 
+It is a Hermes Desktop page, installed once into `~/.hermes/plugins` and then switched on per
+profile. It needs Hermes `>=0.21.5` (Desktop). Nothing else is required to look at the page: the
+metrics sections show "unavailable" until hermes-metrics-dash writes a `metrics.db`, and Merge
+requests shows a setup step until a GitLab login is connected. `Capabilities > Plugins` shows the
+installed version; `CHANGELOG.md` says what changed in it.
+
 **[Install in Hermes Desktop](hermes://plugin/install?repo=https%3A%2F%2Fgithub.com%2Fc-pompa%2Foperations-hermes-desktop-plugin.git%23plugins%2Foperations)** opens Desktop's install dialog with this plugin filled
 in. Where the link does not open (GitHub does not follow `hermes://` links), paste it into your
 browser's address bar, or run it on macOS:
@@ -54,12 +60,16 @@ hermes plugins install "https://github.com/c-pompa/operations-hermes-desktop-plu
 Or in Hermes Desktop: Capabilities > Plugins > Install from Git, with the same URL. Then:
 
 1. Switch Operations on in Capabilities > Plugins (Hermes installs a desktop page switched off,
-   and remembers the choice).
-2. Restart the dashboard so it mounts the backend.
+   and remembers the choice). A profile that lists it under `plugins: disabled` stays off whatever
+   you do here — remove it from that list in the profile's `config.yaml` first.
+2. Restart the dashboard so it mounts the backend. Without that the page is there and its
+   requests fail, which looks like a broken page rather than a restart not done.
 
-`hermes plugins update operations` pulls new versions; the version in Capabilities > Plugins moves
-with each release, and `CHANGELOG.md` says what changed in it. A fresh install opens a
-"Set up Operations" checklist on the Notifications tab (see [Setup checklist](#setup-checklist)).
+`hermes plugins update operations` pulls new versions (a profile with its own copy under
+`~/.hermes/profiles/<profile>/plugins/operations` updates separately: `hermes -p <profile>
+plugins update operations`, and otherwise keeps serving its own older page). A fresh install opens
+a "Set up Operations" checklist on the Notifications tab (see
+[Setup checklist](#setup-checklist)).
 
 ## Page details
 
