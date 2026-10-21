@@ -340,6 +340,11 @@ checklist on the Notifications tab, and an "N setup steps left" link on Overview
 - the Conformance project and what happens when a host drifts
 - optionally, Discord alerts
 
+If the profile you are looking at has its own copy of the plugin and that copy is older than the
+shared install, the Notifications tab says **old copy**, with both versions and the command that
+updates just that profile. Nothing about an old copy looks different on screen otherwise, which is
+why it is called out.
+
 Settings steps open the plugin settings. Desktop builds that form only for a profile with its own
 copy of the plugin, so for a profile using `~/.hermes/plugins` the step shows the
 `hermes -p <profile> config set ...` command with a Copy command button.

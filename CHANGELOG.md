@@ -6,6 +6,19 @@ The plugin's version lives in three places that must agree: `plugins/operations/
 version below has no section here, so `hermes plugins update` and the catalogue can always say
 which build an install is on.
 
+## 0.3.1
+
+**A page that is older than its plugin now says so.** A profile with its own copy under
+`~/.hermes/profiles/<profile>/plugins/operations` is served that copy and never the shared
+install, so a copy left behind serves an old page that looks exactly like a current one — which is
+how 0.2.0 reached nobody on this machine for a day. `GET /setup` now reports both versions
+(`copy: {page, shared, stale, newer, hint}`), and the Notifications tab carries an **old copy** row
+naming them and the command that fixes it (`hermes -p <profile> plugins update operations`), shown
+whether or not the setup checklist still has steps left. A copy that is *newer* than the shared
+install says that too, rather than calling it stale.
+
+Versions are compared as versions, not strings: 0.10.0 is newer than 0.9.0.
+
 ## 0.3.0
 
 **Connect GitLab without leaving the page.** Merge requests, merged changes and a GitLab fleet

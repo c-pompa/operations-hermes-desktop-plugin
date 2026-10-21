@@ -129,5 +129,81 @@ class GitlabConnectTest(unittest.TestCase):
         self.assertNotIn("glpat-secret", str(cm.exception.detail))
 
 
+class PluginCopyTest(unittest.TestCase):
+    """Which copy is serving the page, against the shared install — the quiet failure that hid 0.2.0."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.own = self.root / "profiles" / "gamedev-s2" / "plugins" / "operations"
+        self.shared = self.root / "plugins" / "operations"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def copy_of(self, version, at):
+        at.mkdir(parents=True, exist_ok=True)
+        (at / "plugin.yaml").write_text(f"id: operations\nversion: {version}\n")
+
+    def test_a_profile_copy_left_behind_is_reported_as_stale_with_its_own_command(self):
+        self.copy_of("0.1.0", self.own)
+        self.copy_of("0.3.0", self.shared)
+        with mock.patch.object(api, "get_default_hermes_root", lambda: self.root), \
+             mock.patch.object(api, "__file__", str(self.own / "dashboard" / "plugin_api.py")), \
+             mock.patch.object(api, "_profile_name", lambda: "gamedev-s2"):
+            out = api.plugin_copy()
+        self.assertEqual((out["page"], out["shared"]), ("0.1.0", "0.3.0"))
+        self.assertTrue(out["stale"])
+        self.assertFalse(out["newer"])
+        self.assertIn("hermes -p gamedev-s2 plugins update operations", out["hint"])
+
+    def test_the_shared_install_serving_default_is_not_stale(self):
+        self.copy_of("0.3.0", self.shared)
+        with mock.patch.object(api, "get_default_hermes_root", lambda: self.root), \
+             mock.patch.object(api, "__file__", str(self.shared / "dashboard" / "plugin_api.py")), \
+             mock.patch.object(api, "_profile_name", lambda: "default"):
+            out = api.plugin_copy()
+        self.assertEqual((out["page"], out["shared"]), ("0.3.0", "0.3.0"))
+        self.assertFalse(out["stale"])
+        self.assertEqual(out["hint"], "")
+
+    def test_zero_ten_is_newer_than_zero_nine(self):
+        self.copy_of("0.10.0", self.own)
+        self.copy_of("0.9.0", self.shared)
+        with mock.patch.object(api, "get_default_hermes_root", lambda: self.root), \
+             mock.patch.object(api, "__file__", str(self.own / "dashboard" / "plugin_api.py")), \
+             mock.patch.object(api, "_profile_name", lambda: "writer"):
+            out = api.plugin_copy()
+        # string order would call 0.10.0 the older one
+        self.assertFalse(out["stale"])
+        self.assertTrue(out["newer"])
+
+    def test_a_copy_with_no_shared_install_is_not_called_stale(self):
+        self.copy_of("0.3.0", self.own)
+        with mock.patch.object(api, "get_default_hermes_root", lambda: self.root), \
+             mock.patch.object(api, "__file__", str(self.own / "dashboard" / "plugin_api.py")), \
+             mock.patch.object(api, "_profile_name", lambda: "gamedev-s2"):
+            out = api.plugin_copy()
+        self.assertEqual((out["page"], out["shared"]), ("0.3.0", None))
+        self.assertFalse(out["stale"])
+
+    def test_setup_carries_the_comparison(self):
+        self.copy_of("0.1.0", self.own)
+        self.copy_of("0.3.0", self.shared)
+        with mock.patch.object(api, "get_default_hermes_root", lambda: self.root), \
+             mock.patch.object(api, "__file__", str(self.own / "dashboard" / "plugin_api.py")), \
+             mock.patch.object(api, "_profile_name", lambda: "gamedev-s2"), \
+             mock.patch.object(api, "profile_states", lambda: []), \
+             mock.patch.object(api, "_standard_project", lambda: ""), \
+             mock.patch.object(api, "gitlab_sources", lambda: []), \
+             mock.patch.object(api, "_METRICS_DB", self.root / "nope.db"), \
+             mock.patch.object(api, "_KANBAN_DB", self.root / "nope.db"), \
+             mock.patch.object(api, "gitlab_state", lambda fresh=False: {"host": "", "has_token": False,
+                                                                        "ok": False, "user": None, "error": ""}):
+            out = api.setup()
+        self.assertTrue(out["copy"]["stale"])
+        self.assertEqual(out["copy"]["page"], "0.1.0")
+
+
 if __name__ == "__main__":
     unittest.main()

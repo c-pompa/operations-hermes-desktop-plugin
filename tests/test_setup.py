@@ -189,7 +189,14 @@ await new Promise(r => setTimeout(r, 0))
 console.log(JSON.stringify({ left: steps.filter(x => !x.done).map(x => x.id), toasts: toasts.map(t => t.message),
                              conformance: steps.find(x => x.id === 'conformance'),
                              gitlab: steps.find(x => x.id === 'gitlab'),
-                             steps: Object.fromEntries(steps.map(x => [x.id, x])) }))
+                             steps: Object.fromEntries(steps.map(x => [x.id, x])),
+                             copies: [
+                               copyNote({ page: '0.1.0', shared: '0.3.0', stale: true, newer: false,
+                                          hint: 'run hermes -p gamedev-s2 plugins update operations, then restart Hermes Desktop' }),
+                               copyNote({ page: '0.3.0', shared: '0.3.0', stale: false, newer: false, hint: '' }),
+                               copyNote({ page: '0.10.0', shared: '0.9.0', stale: false, newer: true, hint: '' }),
+                               copyNote(null), copyNote({ page: '0.3.0', shared: null }),
+                             ] }))
 """
 
 FRESH = {"profiles": [{"profile": "default", "state": "on"}, {"profile": "a", "state": "missing"},
@@ -212,6 +219,17 @@ class ChecklistTest(unittest.TestCase):
         # page must not leave a box nobody can tick
         self.assertEqual(out["left"], ["metrics", "gitlab", "conformance", "drift"])
         self.assertEqual(out["toasts"], ["4 setup steps left"])
+
+    def test_the_page_says_when_its_own_copy_is_older_than_the_shared_install(self):
+        notes = self.run_js(FRESH)["copies"]
+        # a stale copy names both versions and the command that fixes it, not just "update"
+        self.assertIn("0.1.0", notes[0])
+        self.assertIn("0.3.0", notes[0])
+        self.assertIn("hermes -p gamedev-s2 plugins update operations", notes[0])
+        self.assertIsNone(notes[1])                       # same version: nothing to say
+        self.assertIn("newer than the shared install", notes[2])
+        self.assertIsNone(notes[3])                       # no data yet
+        self.assertIsNone(notes[4])                       # no shared install to compare against
 
     def test_the_profile_step_is_about_this_profile_and_names_the_others(self):
         on = self.run_js({**FRESH, "profile": "backend-eng", "profiles": [

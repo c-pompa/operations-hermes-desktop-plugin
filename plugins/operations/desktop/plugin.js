@@ -5138,6 +5138,33 @@ function GitlabConnect({ step, onDone }) {
   ] })
 }
 
+// A profile with its own copy of the plugin is served that copy and never the shared install, so
+// a copy left behind serves an old page that looks exactly like a current one. Say which is which.
+function copyNote(copy) {
+  if (!copy || !copy.page || !copy.shared) return null
+  if (copy.stale) {
+    return `This profile runs its own copy of Operations ${copy.page}, older than the shared install (${copy.shared}), so this page is ${copy.page}'s. To update it, ${copy.hint || 'run hermes plugins update operations, then restart Hermes Desktop'}.`
+  }
+  if (copy.newer) {
+    return `This profile runs its own copy of Operations ${copy.page}, newer than the shared install (${copy.shared}): other profiles still get ${copy.shared}.`
+  }
+  return null
+}
+
+function PageCopyWarning() {
+  const { data } = useSetup()
+  const note = copyNote(data && data.copy)
+  if (!note) return null
+  return jsxs('div', {
+    className: 'flex items-start gap-2 rounded-md border px-3 py-2 text-xs',
+    style: { borderColor: 'color-mix(in srgb, ' + TONE.bad + ' 55%, transparent)', backgroundColor: 'color-mix(in srgb, ' + TONE.bad + ' 10%, transparent)' },
+    children: [
+      jsx(Tag, { tone: 'bad', children: 'old copy' }),
+      jsx('div', { className: 'min-w-0 flex-1 leading-snug', style: { userSelect: 'text' }, children: note })
+    ]
+  })
+}
+
 function SetupChecklist() {
   const { data, refetch } = useSetup()
   const [hidden, setHidden] = useState(() => { try { return api.storage.get(SETUP_HIDDEN, false) } catch { return false } })
@@ -5586,6 +5613,7 @@ function NotificationsPage({ onRead }) {
         log.length ? jsx('button', { type: 'button', className: 'text-[0.6875rem] text-(--ui-text-quaternary) underline', onClick: clear, children: 'Clear' }) : null
       ] }),
       jsx(SetupChecklist, {}),
+      jsx(PageCopyWarning, {}),
       // A poll that cannot read Needs attention says so here, with the moment it started: the
       // alternative is a page that looks quiet because it is deaf.
       health ? jsxs('div', {

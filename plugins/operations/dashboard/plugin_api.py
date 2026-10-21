@@ -103,7 +103,9 @@ whether metrics.db and the kanban board exist, whether GitLab answers (its host,
 set, and one GET /user at most every five minutes, since Merge requests, changes and a GitLab fleet
 standard read nothing without it), and the conformance_project, alert_target,
 drift_action and drift_profile settings, and from_default: which of those this profile takes from
-the default profile's settings. Also the requesting profile and settings_page: whether
+the default profile's settings. Also copy: the version of the plugin copy serving this request
+against the shared install's (a profile with its own copy under <profile>/plugins/operations is
+served that one and never the shared one, so a copy left behind serves an old page silently). Also the requesting profile and settings_page: whether
 Hermes Desktop has a settings form for operations there, which it only builds for a profile with
 its own copy under <profile>/plugins (a root-only install has none in named profiles). Read only.
 
@@ -144,7 +146,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent.secret_scope import get_secret
 from fastapi import APIRouter, Body, HTTPException, Query
@@ -597,6 +599,44 @@ _GITLAB_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?$")
 def _profile_name() -> str:
     """The profile this dashboard request is running as ("default" for the root home)."""
     return "default" if get_hermes_home() == get_default_hermes_root() else get_hermes_home().name
+
+
+def _plugin_version(at: Path) -> Optional[str]:
+    """The version line of one plugin copy's plugin.yaml, or None when there is no copy there."""
+    try:
+        text = (at / "plugin.yaml").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    found = re.search(r"^version:\s*(\S+)", text, re.M)
+    return found.group(1) if found else None
+
+
+def _version_key(version: str) -> Tuple[int, ...]:
+    """0.3.0 -> (0, 3, 0) so 0.10.0 is not "older" than 0.9.0 by string order."""
+    return tuple(int(p) if p.isdigit() else 0 for p in re.split(r"[.+-]", version)[:3]) or (0,)
+
+
+def plugin_copy() -> Dict[str, Any]:
+    """This page's copy against the shared install, because only one of them wins per profile.
+
+    A profile with its own copy under <profile>/plugins/operations is served that copy and never
+    the shared one, so a copy left behind serves an old page for months while the shared install
+    moves on — which is exactly how the 0.2.0 work reached nobody on this machine. Compare the two
+    so the page can say it, instead of looking unchanged.
+    """
+    own_dir = Path(__file__).resolve().parent.parent
+    shared_dir = get_default_hermes_root() / "plugins" / "operations"
+    page = _plugin_version(own_dir)
+    shared = _plugin_version(shared_dir) if own_dir.resolve() != shared_dir.resolve() else page
+    stale = bool(page and shared and _version_key(page) < _version_key(shared))
+    newer = bool(page and shared and _version_key(page) > _version_key(shared))
+    if not stale:
+        hint = ""
+    elif _profile_name() == "default":
+        hint = "run hermes plugins update operations, then restart Hermes Desktop"
+    else:
+        hint = (f"run hermes -p {_profile_name()} plugins update operations, then restart Hermes Desktop")
+    return {"page": page, "shared": shared, "own": str(own_dir), "stale": stale, "newer": newer, "hint": hint}
 
 
 def _env_logins(path: Path) -> Dict[str, str]:
@@ -2967,6 +3007,7 @@ def setup() -> Dict[str, Any]:
     return {"profiles": profile_states(), "metrics": _METRICS_DB.exists(), "kanban": _KANBAN_DB.exists(),
             "conformance_project": _standard_project(),
             "gitlab": {**gitlab_state(), "sources": gitlab_sources()},
+            "copy": plugin_copy(),
             "alert_target": (s.get("alert_target") or "").strip(),
             "drift_action": action, "drift_profile": (s.get("drift_profile") or "").strip(),
             "profile": "default" if get_hermes_home() == get_default_hermes_root() else get_hermes_home().name,
