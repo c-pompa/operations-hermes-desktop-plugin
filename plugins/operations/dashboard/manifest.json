@@ -3,7 +3,7 @@
   "label": "Operations",
   "description": "Operations for a fleet: vitals and today's activity, what needs attention, hosts and the model pool, request flow, activity, handoffs, traces, merge requests, topology with replay, conformance checks and alerts",
   "icon": "Activity",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "tab": {
     "path": "/operations",
     "hidden": true

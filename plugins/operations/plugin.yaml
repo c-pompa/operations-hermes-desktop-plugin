@@ -1,5 +1,5 @@
 name: operations
-version: 0.3.1
+version: 0.3.2
 manifest_version: 2
 requires_hermes: ">=0.21.5"
 description: >-
