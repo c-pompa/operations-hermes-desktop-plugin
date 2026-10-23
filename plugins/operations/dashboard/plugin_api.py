@@ -45,6 +45,20 @@ cards (created_by to assignee, with every run and its outcome) and subagent
 delegations (subagent_stop records grouped by parent session, with each
 child's model and request count), plus totals per (from, to) pair.
 
+GET /errors?hours=N returns the window's failed model calls grouped by what
+failed and where (the Overview's Errors, and what Flow opens when something
+failed): each group with its count, its sessions, and how busy its model was.
+Each group the core can name also carries a diagnosis: the reason class from
+the app's own classifier (agent.error_classifier by way of
+cron.scheduler_failure_copy), a plain-language cause that names the provider
+that refused — for billing, that it is THAT provider's account that is out of
+credit, not another account or portal the same person funds — and the concrete
+remedy with its commands, prefilled from the record: the failing cron job's id
+comes out of its run session (cron_<job_id>_<timestamp>), so the remedy is
+`hermes cron edit <job_id> --provider <name>` and `hermes cron run <job_id>`.
+A failure whose text names no class, and a Hermes whose core predates the
+classifier, keep the raw error text alone.
+
 GET /assignees lists the profiles a card can be handed to. POST
 /cards/{id}/assign {"profile"} hands an open card to one and, when the card is
 ready, starts that profile's worker at once through
@@ -1008,10 +1022,211 @@ def flow(hours: int = Query(24, ge=1, le=168), start: Optional[float] = None) ->
     return out
 
 
+# ── Why a failed call failed, and the one concrete thing to do about it ─────────────────────────
+# The reason class comes from the app's ONE classifier (cron.scheduler_failure_copy over
+# agent.error_classifier): this plugin has the failure as text out of metrics.db and classifies it
+# through the core rather than growing a second ladder of status codes and substrings that only one
+# side of the repo would test. Every import here is optional: a Hermes predating these modules
+# leaves each group as the error text it always served.
+
+# The one class whose cause has to say which pot of money is empty. A provider's own balance is not
+# the balance of any other account or portal the same person funds, and wording the two as one is
+# what sent an operator looking at a funded account while the failing one was at zero.
+_BILLING_REASONS = frozenset({"billing", "billing_unverified"})
+_AUTH_REASONS = frozenset({"auth", "auth_permanent"})
+_MODEL_REASONS = frozenset({"model_not_found", "model_entitlement"})
+_TOO_BIG_REASONS = frozenset({"context_overflow", "payload_too_large"})
+_TRANSIENT_REASONS = frozenset({"timeout", "rate_limit", "upstream_rate_limit", "overloaded", "server_error",
+                                "incomplete_response"})
+
+
+def _core_reason(error: Optional[str]) -> Optional[str]:
+    """The core classifier's reason for a failure's text, or None when this Hermes cannot classify at
+    all (no such module): the group is then served as its plain error text, as it always was."""
+    text = (error or "").strip()
+    if not text:
+        return None
+    try:
+        from cron.scheduler_failure_copy import classify_cron_failure_reason
+    except ImportError:
+        pass
+    else:
+        try:
+            return str(classify_cron_failure_reason(text))
+        except Exception:  # a classifier that trips must not blank the failure list
+            return None
+    try:
+        from agent.error_classifier import classify_api_error
+    except ImportError:
+        return None
+    try:
+        return classify_api_error(Exception(text)).reason.value
+    except Exception:
+        return None
+
+
+def _core_gloss(reason: str) -> Optional[str]:
+    """The core's plain clause for a reason (the gloss cron notices and subagent notices share), so
+    the plugin never words a class differently from the CLI. None when this core has no gloss table."""
+    try:
+        from agent.turn_failure_copy import failure_cause_gloss
+    except ImportError:
+        return None
+    try:
+        return failure_cause_gloss(reason, subject="the call", possessive="the call's")
+    except Exception:
+        return None
+
+
+def cron_job_of(session_id: Optional[str]) -> Optional[str]:
+    """The cron job a run session names (``cron_<job_id>_<timestamp>``), through the core's own reader
+    for those ids. A unified-runtime session (``local-…``) names no job, and a Hermes without the
+    reader yields None: the remedy then says where to find the job instead of inventing an id."""
+    sid = str(session_id or "")
+    if not sid:
+        return None
+    try:
+        from hermes_state_keys import legacy_cron_run_job
+    except ImportError:
+        return None
+    try:
+        return legacy_cron_run_job(sid)
+    except Exception:
+        return None
+
+
+def _relogin_command(provider: str, profile: Optional[str]) -> str:
+    """The command that re-signs a rejected credential. The core's provider table decides whether it is
+    an OAuth grant or an API key, and the failing record's own profile is pinned by name when it is not
+    the default one: a bare ``hermes auth add`` from another profile signs the wrong store."""
+    slug = (provider or "").strip().lower()
+    try:
+        from agent.error_surface import auth_kind
+    except ImportError:
+        oauth = False
+    else:
+        try:
+            oauth = auth_kind(slug) == "oauth"
+        except Exception:
+            oauth = False
+    named = (profile or "").strip()
+    selector = f"-p {named} " if named and named != "default" else ""
+    return f"hermes {selector}auth add {slug or '<provider>'}" + (" --type oauth" if oauth else "")
+
+
+def _failure_cause(reason: str, provider: str) -> str:
+    """One plain sentence: who refused the call, and why. Billing names the provider's own account."""
+    who, acct = provider or "the provider", provider or "provider"
+    if reason in _BILLING_REASONS:
+        return (f"{who} refused the call: the {acct} account itself is out of credit — the balance {who}"
+                f" holds for API calls, which is not the balance of any other account or portal you"
+                f" fund. Money funded elsewhere does not pay for calls sent to {who}.")
+    if reason == "unknown":
+        return ("The failure text names no class the classifier knows" + (f" for {who}" if provider else "")
+                + " — the error above is what the far side said, as it said it.")
+    gloss = _core_gloss(reason)
+    return f"{who} refused the call: {gloss}." if gloss else f"{who} refused the call ({reason})."
+
+
+_JOB_NOTE = (" Its run session names the job (cron_<job_id>_<timestamp>), so fill the id in from there;"
+             " `hermes cron list` names it too.")
+
+
+def _run_again(job_id: Optional[str]) -> str:
+    return f"hermes cron run {job_id or '<job_id>'}"
+
+
+def _failure_remedy(reason: str, provider: str, job_id: Optional[str], cron: bool,
+                    profile: Optional[str] = None) -> Dict[str, Any]:
+    """The concrete way out of this class of failure, as a sentence and as the commands it names: a
+    cron failure gets the job's own commands with its id filled in, anything else the provider-level one."""
+    who = provider or "the provider"
+    relogin = _relogin_command(provider, profile)
+    if reason in _BILLING_REASONS:
+        if cron:
+            repoint = f"hermes cron edit {job_id or '<job_id>'} --provider <name>"
+            return {"text": f"Top up the {who} account, or repoint the job: `{repoint}`; then `{_run_again(job_id)}`"
+                            " to retry.", "commands": [repoint, _run_again(job_id)]}
+        return {"text": f"Top up the {who} account, or send these calls somewhere else (pick another model for"
+                        f" this profile); then retry. Nothing about the request itself is wrong.",
+                "commands": []}
+    if reason in _AUTH_REASONS:
+        if cron:
+            return {"text": f"Sign in again for {who}: `{relogin}`; then `{_run_again(job_id)}` to retry.",
+                    "commands": [relogin, _run_again(job_id)]}
+        return {"text": f"Sign in again for {who}: `{relogin}`, then retry.", "commands": [relogin]}
+    if reason in _MODEL_REASONS:
+        if cron:
+            pick = f"hermes cron edit {job_id or '<job_id>'} --model <name>"
+            return {"text": f"Pick another model for the job: `{pick}`.", "commands": [pick]}
+        return {"text": f"Pick another model for these calls: {who} has no such model, so the same name"
+                        " will keep failing.", "commands": []}
+    if reason == "unknown":
+        if cron:
+            run = _run_again(job_id)
+            return {"text": f"Nothing here names the cause: run the job again with `{run}`, and treat the error above"
+                            " as the provider wrote it.", "commands": [run]}
+        return {"text": "Nothing here names the cause: retry, and treat the error above as the provider wrote it.",
+                "commands": []}
+    if reason in _TOO_BIG_REASONS:
+        if cron:
+            shorter = f"hermes cron edit {job_id or '<job_id>'} --prompt <text>"
+            return {"text": f"Send less: `{shorter}`.", "commands": [shorter]}
+        return {"text": "Send less (a shorter prompt or a fresh session): the request outgrew what the model"
+                        " will read.", "commands": []}
+    if reason in _TRANSIENT_REASONS:
+        if cron:
+            return {"text": f"{who} was busy or slow rather than broken: wait for its next run, or try now with"
+                            f" `{_run_again(job_id)}`.", "commands": [_run_again(job_id)]}
+        return {"text": f"{who} was busy or slow rather than broken: these calls are worth retrying as they are.",
+                "commands": []}
+    if cron:
+        # a class this plugin has no sentence for: the CLI's own advice for the job, when this core has it
+        try:
+            from cron.scheduler_failure_copy import _PROVIDER_FAILURE_ACTION, _DEFAULT_FAILURE_ACTION
+        except ImportError:
+            pass
+        else:
+            try:
+                action = _PROVIDER_FAILURE_ACTION.get(reason, _DEFAULT_FAILURE_ACTION).format(
+                    job_id=job_id or "<job_id>", relogin=relogin)
+                if action:
+                    return {"text": action, "commands": [_run_again(job_id)]}
+            except Exception:
+                pass
+    return {"text": "Try these calls again; the error text above is what to search for if they keep failing.",
+            "commands": []}
+
+
+def failure_diagnosis(g: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """What a group of failed calls ran into, in words, and the one concrete way out of it.
+
+    ``reason`` is the core classifier's class; ``cause`` names the provider that refused and, for
+    billing, says plainly that it is THAT provider's account that is empty; ``remedy`` and the
+    ``commands`` it quotes are prefilled from the record (the failing cron job's id is recovered from
+    its run session). None when nothing can name the failure — no error text, or a Hermes whose core
+    has no classifier — which leaves the group as the raw error text it was.
+    """
+    reason = _core_reason(g.get("error"))
+    if reason is None:
+        return None
+    provider = str(g.get("provider") or "").strip()
+    job_id = next((j for j in (cron_job_of(s) for s in g.get("sessions") or []) if j), None)
+    cron = g.get("platform") == "cron" or job_id is not None
+    remedy = _failure_remedy(reason, provider, job_id, cron, g.get("profile"))
+    text = remedy["text"] + (_JOB_NOTE if cron and not job_id else "")
+    out = {"reason": reason, "cause": _failure_cause(reason, provider),
+           "remedy": text, "commands": remedy["commands"], "provider": provider, "cron": cron}
+    if job_id:
+        out["job_id"] = job_id
+    return out
+
+
 def error_groups(m: sqlite3.Connection, since: float, until: float) -> List[Dict[str, Any]]:
     """The window's failed calls grouped by what failed and where, most first, newest session first. A client's
     group also says how many timed out, and how busy its model was then: the median count of other sessions with a
-    call to it in flight while each failed one waited, and what served those that got an answer."""
+    call to it in flight while each failed one waited, and what served those that got an answer. Each group carries
+    the diagnosis of its failure when it can be named (see failure_diagnosis)."""
     groups: Dict[tuple, Dict[str, Any]] = {}
     spans: Dict[tuple, List[tuple]] = {}
     for r in m.execute(f"SELECT ts, {_cols(m, 'host', 'device', 'provider', 'platform', 'profile', 'model', 'event', 'error', 'session_id', 'duration_s')}"
@@ -1020,6 +1235,7 @@ def error_groups(m: sqlite3.Connection, since: float, until: float) -> List[Dict
         served = _served(r["device"], r["provider"], True) if r["platform"] else r["device"] or r["provider"]
         key = (r["host"], r["platform"], r["profile"], r["model"], served, r["event"], r["error"])
         g = groups.setdefault(key, {"host": r["host"], "platform": r["platform"], "profile": r["profile"], "model": r["model"],
+                                    "provider": r["provider"],
                                     "served": served, "no_answer": bool(r["platform"] and not r["device"]),
                                     "event": r["event"], "error": r["error"], "count": 0, "timeouts": 0,
                                     "first": r["ts"], "last": r["ts"], "sessions": []})
@@ -1038,6 +1254,10 @@ def error_groups(m: sqlite3.Connection, since: float, until: float) -> List[Dict
                     by[x["answered_by"]] = by.get(x["answered_by"], 0) + 1
             g["busy"] = round(statistics.median(x["busy"] for x in load))
             g["answered_by"] = max(by, key=by.get) if by else None
+        # why it failed and what to do, when the core can name the failure at all
+        diagnosis = failure_diagnosis(g)
+        if diagnosis is not None:
+            g["diagnosis"] = diagnosis
     return sorted(groups.values(), key=lambda g: -g["count"])
 
 

@@ -83,7 +83,8 @@ a "Set up Operations" checklist on the Notifications tab (see
   the failed calls; tasks link to Handoffs. A health finding about a session links to the session
   in Trace and to its profile on the map over the session (its last hour if it ran longer).
   Incidents and each group of failed calls have **Fix this**, as on a Needs attention card: a new
-  chat or a kanban card for a profile, with what failed, where, its sessions and how to check.
+  chat or a kanban card for a profile, with what failed, where, its sessions, how to check, and —
+  for a failure the classifier can name — what it was and the way out of it.
   An incident about a model router role with no loaded model is handed to an agent, not fixed by
   the plugin: a new chat on a profile whose config has `rolectl-mcp` under `mcp_servers` with
   `ROLECTL_MCP_ALLOW_WRITE: "1"` (on the profile's default model, changeable with the model pill),
@@ -92,7 +93,14 @@ a "Set up Operations" checklist on the Notifications tab (see
   the role drawer offer a chat that adds rolectl-mcp to this profile's config, or the lines to copy.
 - **Errors in an hour** are grouped by what failed and where (error text, entry point and host,
   profile, model, what served it), each linking to its newest failing session in Trace, its
-  model in Flow and the map over that hour.
+  model in Flow and the map over that hour. Under the provider's own error text, a group the
+  classifier can name also reads in plain words: what the failure is, and the one way out of it
+  with the commands to type, a cron job's own id filled in from its run session —
+  `hermes cron edit <job_id> --provider <name>` and `hermes cron run <job_id>` for a refused
+  account, `hermes auth add <provider>` for a rejected sign-in, `hermes cron edit <job_id>
+  --model <name>` for a model the provider does not have. A billing refusal says which account
+  is empty: the provider's own, not another account or portal you fund. A failure nothing can
+  name, and a Hermes without the classifier, keep the error text alone as before.
 - **Needs attention** includes kanban cards waiting on a person (blocked or in triage), with the
   worker's reason and a link to the card in Handoffs.
 - **Changes and news**: merged MRs and model loads.
@@ -171,7 +179,8 @@ with.
 - **What failed**: when part of a selection failed, the side panel lists each error, where and
   when, with links to the session in Trace and to the map. Under each, a cause line says how many
   timed out at Hermes' 30 minute limit for a model call (`HERMES_API_TIMEOUT`), how many other
-  sessions had calls to that model in flight meanwhile, and what served those that got an answer.
+  sessions had calls to that model in flight meanwhile, and what served those that got an answer;
+  below that, the classified cause and the remedy with its commands, when the failure can be named.
 - **Fit to screen** (in the Request flow header) gives the chart the page's full width on a wider
   canvas, so its labels read larger without the bands swelling, and moves the side panel below
   it: what failed on the left, where the requests went on the right. "Side by side" puts it

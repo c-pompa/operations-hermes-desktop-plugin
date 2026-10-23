@@ -866,6 +866,12 @@ function errorRows(groups, { hours, start, flow }) {
       g.timeouts && `${g.timeouts === g.count ? 'All' : `${g.timeouts} of ${g.count}`} timed out waiting for an answer (Hermes' limit for a model call)`,
       g.busy && `about ${plural(g.busy, 'other session')} had ${g.model} calls in flight while each waited`,
       g.answered_by && `the ones answered were served by ${g.answered_by}`].filter(Boolean).join(' · ') }) : null,
+    // and what the failure is, in words, with the way out: the backend's diagnosis (reason class,
+    // cause, remedy) muted under the provider's own error text, one line each
+    g.diagnosis ? jsxs('div', { className: 'grid gap-0.5', style: { fontSize: 12.5, color: DIM }, children: [
+      jsx('div', { key: 'c', children: g.diagnosis.cause }),
+      jsx('div', { key: 'r', children: g.diagnosis.remedy })
+    ] }) : null,
     jsxs('div', { className: 'flex flex-wrap gap-3', children: [
       g.sessions.length ? jsx(GoLink, { key: 't', tab: 'trace', sel: g.sessions[0], hours, start,
         children: g.sessions.length > 1 ? `Open the newest of ${g.sessions.length} sessions in Trace` : 'Open the session in Trace' }) : null,
@@ -890,7 +896,10 @@ const errorAlert = g => {
     intro: `Hermes Operations counted these failed model calls ${g.first === g.last ? 'at' : 'between'} ${when}:`,
     action: [g.profile && `profile ${g.profile}`, g.model && `model ${g.model}`, g.served && (g.no_answer ? g.served : `served by ${g.served}`),
              g.timeouts && `${g.timeouts} of ${g.count} timed out waiting for an answer (Hermes' limit for a model call)`,
-             g.busy && `about ${plural(g.busy, 'other session')} had ${g.model} calls in flight while each waited`].filter(Boolean).join('; '),
+             g.busy && `about ${plural(g.busy, 'other session')} had ${g.model} calls in flight while each waited`,
+             // the backend's diagnosis, so a chat or a card handed this failure is told what it is
+             // and what to do, not just that it happened
+             g.diagnosis && `${g.diagnosis.cause} ${g.diagnosis.remedy}`].filter(Boolean).join('; '),
     check: 'Find out why they failed and fix it if you can. Check first whether calls like these still fail: Errors on the Operations Overview lists them by hour.'
   }
 }

@@ -6,6 +6,31 @@ The plugin's version lives in three places that must agree: `plugins/operations/
 version below has no section here, so `hermes plugins update` and the catalogue can always say
 which build an install is on.
 
+## 0.3.4
+
+**A failed model call now says what it is and what to do about it.** The Overview's Errors listed a
+provider's own words and stopped there. An operator reading `APIStatusError: Error code: 402 -
+{'error': {'message': 'Insufficient Balance …'}}` had to go to another machine to work out which
+account was empty (the provider's platform, not the portal that was funded), what to change, and the
+exact command to type.
+
+Every group of failed calls the core's own classifier can name now carries a diagnosis under the
+error text, in plain words, visually secondary to it:
+
+- the reason class, from the app's single classifier (`agent.error_classifier`, by way of
+  `cron.scheduler_failure_copy`) — the plugin holds no second ladder of status codes and substrings
+- a cause that names the provider that refused, and for a billing refusal says plainly that it is
+  THAT provider's account that is out of credit, not another account or portal the same person funds
+- the concrete remedy with its commands, prefilled from the record: a cron job's id comes out of its
+  run session (`cron_<job_id>_<timestamp>`), so a refused account reads
+  `hermes cron edit <job_id> --provider <name>` then `hermes cron run <job_id>`, a rejected sign-in
+  `hermes auth add <provider>`, a missing model `hermes cron edit <job_id> --model <name>`. A
+  desktop or CLI failure gets the provider-level remedy. **Fix this** hands the same diagnosis to the
+  chat or card it hands the failure to.
+
+A failure whose text names no class keeps the error text alone, and a Hermes predating those core
+modules serves exactly what it served before: every import is feature-detected.
+
 ## 0.3.3
 
 **Connect GitLab no longer reads another tool's credential store.** The step offered every GitLab
