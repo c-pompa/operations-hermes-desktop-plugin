@@ -6,6 +6,25 @@ The plugin's version lives in three places that must agree: `plugins/operations/
 version below has no section here, so `hermes plugins update` and the catalogue can always say
 which build an install is on.
 
+## 0.3.3
+
+**Connect GitLab no longer reads another tool's credential store.** The step offered every GitLab
+login it could find on the machine, and two of those were files it parsed itself: another profile's
+`.env`, and the `glab` CLI's own config. That is a rule-11 problem in the catalogue's admission
+policy — a plugin gets secrets through Hermes' routes, not by reading credential stores — and it was
+the one place this plugin reached into a store it does not own. The step now offers:
+
+- this profile's environment, read through `get_secret` so the active profile decides which value is
+  seen
+- the host the `gitlab-mr` plugin is configured with — a host, never a token
+- a host and token typed into the step, written through the plugin-settings writer and the `.env`
+  credential route as `OPERATIONS_GITLAB_TOKEN`, never sent back to the page
+
+A login that exists only in `glab` or in another profile's `.env` is typed in once instead of
+adopted. Everything else about the step is unchanged: the probe, the two settings it writes, and the
+rule that a token is never returned, logged, or put in an error message. The tests plant those files
+and assert nothing in the setup payload comes from them.
+
 ## 0.3.2
 
 **Nothing of the author's fleet ships to anyone else.** Every install was getting this machine's

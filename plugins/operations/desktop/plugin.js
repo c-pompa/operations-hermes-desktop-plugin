@@ -5073,8 +5073,9 @@ function rolectlToast(ctx) {
   ctx.onDispose(() => clearInterval(timer))
 }
 
-// The login this machine already holds that the step can adopt in one press: a source with both a
-// host and a token, preferring one for the host the plugin is already pointed at.
+// The login the step may adopt in one press: this profile's environment, or the gitlab-mr host once
+// a token is typed against it. A source with both a host and a token, preferring one for the host
+// the plugin is already pointed at.
 function gitlabConnect(s) {
   const gl = s.gitlab || {}
   const sources = gl.sources || []

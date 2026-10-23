@@ -110,12 +110,13 @@ Hermes Desktop has a settings form for operations there, which it only builds fo
 its own copy under <profile>/plugins (a root-only install has none in named profiles). Read only.
 
 POST /setup/gitlab {"source": "<id>"} or {"host", "token"} connects GitLab for the requesting
-profile: it adopts a login already on this machine (the ids /setup lists: this profile's env,
-another profile's .env, the gitlab-mr plugin's host, the glab CLI) or takes a typed pair, then
-writes the plugin's own settings — gitlab_host through the plugin-settings writer, gitlab_token
-through the .env credential route as OPERATIONS_GITLAB_TOKEN, never into config.yaml — and answers
-with the same probe. A token is never returned, logged, or put in an error message; a source with
-only a token is offered for the host this profile is already pointed at.
+profile: it adopts a login this plugin may see (the ids /setup lists: this profile's env through
+get_secret, the gitlab-mr plugin's host) or takes a typed pair, then writes the plugin's own
+settings — gitlab_host through the plugin-settings writer, gitlab_token through the .env
+credential route as OPERATIONS_GITLAB_TOKEN, never into config.yaml — and answers with the same
+probe. A token is never returned, logged, or put in an error message; a source with only a token is
+offered for the host this profile is already pointed at. No other credential store is read: not
+another profile's .env, not the glab CLI's config (the catalogue's rule 11).
 
 Settings live in config.yaml under plugins.entries.operations.settings and are
 edited from Capabilities > Plugins in Hermes Desktop (see plugin.yaml).
@@ -639,55 +640,27 @@ def plugin_copy() -> Dict[str, Any]:
     return {"page": page, "shared": shared, "own": str(own_dir), "stale": stale, "newer": newer, "hint": hint}
 
 
-def _env_logins(path: Path) -> Dict[str, str]:
-    """GITLAB_HOST / GITLAB_TOKEN out of one .env file. Values are kept: the caller decides what
-    to expose, and only an explicit "use this one" ever reads them."""
-    found: Dict[str, str] = {}
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return found
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        if key in ("GITLAB_HOST", "GITLAB_TOKEN", "OPERATIONS_GITLAB_TOKEN"):
-            found[key] = value.strip().strip('"').strip("'")
-    return found
-
-
-def _glab_login() -> Dict[str, str]:
-    """host + token from the glab CLI's own config, when it holds one."""
-    path = Path.home() / ".config" / "glab-cli" / "config.yml"
-    try:
-        data = safe_load(path.read_text(encoding="utf-8")) or {}
-    except (OSError, YAMLError):
-        return {}
-    hosts = data.get("hosts") if isinstance(data, dict) else None
-    if not isinstance(hosts, dict):
-        return {}
-    for host, cfg in hosts.items():
-        if not isinstance(cfg, dict):
-            continue
-        token = cfg.get("token") or cfg.get("api_token")
-        if token:
-            return {"host": str(host), "token": str(token)}
-    return {}
-
-
 def gitlab_logins() -> List[Dict[str, str]]:
-    """Every GitLab login this machine already holds, as ``{id, label, host, token}``.
+    """Every GitLab login the Connect step may offer, as ``{id, label, host, token}``.
 
-    What the Connect GitLab step can adopt without anyone pasting a token: this profile's own
-    environment, another profile's .env, the gitlab-mr plugin's settings (host only), and the glab
-    CLI. Only :func:`gitlab_sources` is exposed to the page, and it drops the token.
+    Two sources, both of the kind the catalogue's rule 11 allows:
+
+    - ``env``: this profile's own environment, read through ``get_secret`` so the active profile
+      decides which value is seen. The profile's ``.env`` is Hermes' credential store: Hermes reads
+      it and the plugin is handed the value.
+    - ``gitlab-mr``: the host the ``gitlab-mr`` plugin is configured with — a host, never a token.
+
+    Deliberately **not** read: other profiles' ``.env`` files, another tool's login (the ``glab``
+    CLI's own config), or any other credential store. Offering them meant parsing files rule 11 says
+    a plugin does not touch; that the user had to press the login afterwards did not make the read
+    any less of a read. A machine whose only GitLab login lives in ``glab`` types the pair into the
+    step, which writes it through Hermes' own writers.
+
+    Only :func:`gitlab_sources` is exposed to the page, and it drops the token.
     """
-    root = get_default_hermes_root()
     out: List[Dict[str, str]] = []
-    # A source holding only a token (a profile .env with GITLAB_TOKEN and nothing else) is a login
-    # for the host this plugin is already pointed at, so that is the host it offers.
+    # A source holding only a token (GITLAB_TOKEN with no GITLAB_HOST) is a login for the host this
+    # plugin is already pointed at, so that is the host it offers.
     current = _gitlab_host()
 
     def add(source_id: str, label: str, host: str, token: str) -> None:
@@ -702,14 +675,8 @@ def gitlab_logins() -> List[Dict[str, str]]:
 
     add("env", "this profile's environment", get_secret("GITLAB_HOST") or "",
         get_secret("OPERATIONS_GITLAB_TOKEN") or get_secret("GITLAB_TOKEN") or "")
-    for name in kanban_db.list_profiles_on_disk():
-        home = root if name == "default" else root / "profiles" / name
-        env = _env_logins(home / ".env")
-        if env:
-            add(f"profile:{name}", f"the {name} profile's .env", env.get("GITLAB_HOST", ""),
-                env.get("OPERATIONS_GITLAB_TOKEN") or env.get("GITLAB_TOKEN", ""))
-    # the gitlab-mr plugin is where a GitLab login usually already lives; it keeps the host in its
-    # settings and reads the token from GITLAB_TOKEN, so this source names a host, not a token
+    # the gitlab-mr plugin usually already names the host; it keeps that host in its own settings
+    # (and reads the token from GITLAB_TOKEN), so this source offers a host, never a token
     for name in dict.fromkeys((_profile_name(), "default")):
         cfg = _profile_config(str(name))
         try:
@@ -720,8 +687,6 @@ def gitlab_logins() -> List[Dict[str, str]]:
         if isinstance(mr, dict):
             add("gitlab-mr", "the gitlab-mr plugin", str(mr.get("gitlab_host") or mr.get("host") or ""), "")
             break
-    glab = _glab_login()
-    add("glab", "the glab CLI", glab.get("host", ""), glab.get("token", ""))
     return out[:GITLAB_SOURCES_MAX]
 
 

@@ -266,16 +266,16 @@ class ChecklistTest(unittest.TestCase):
         self.assertFalse(step["done"])
         self.assertIn("did not answer (timed out)", step["text"])
 
-    def test_the_gitlab_step_offers_the_login_already_on_the_machine(self):
+    def test_the_gitlab_step_offers_the_login_it_may_adopt(self):
         # a complete source for another host, and one for the host the plugin is pointed at:
         # the matching one wins, so pressing it cannot quietly move the plugin to another GitLab
         step = self.run_js({**FRESH, "gitlab": {
             "host": "gitlab.example.com", "has_token": False, "ok": False, "user": None, "error": "no GitLab token set",
-            "sources": [{"id": "glab", "label": "the glab CLI", "host": "gitlab.other", "has_token": True},
-                        {"id": "profile:ops", "label": "the ops profile's .env", "host": "gitlab.example.com", "has_token": True}],
+            "sources": [{"id": "env", "label": "this profile's environment", "host": "gitlab.other", "has_token": True},
+                        {"id": "gitlab-mr", "label": "the gitlab-mr plugin", "host": "gitlab.example.com", "has_token": True}],
         }})["gitlab"]
-        self.assertEqual(step["connect"]["source"], "profile:ops")
-        self.assertEqual(step["connect"]["label"], "the ops profile's .env")
+        self.assertEqual(step["connect"]["source"], "gitlab-mr")
+        self.assertEqual(step["connect"]["label"], "the gitlab-mr plugin")
         self.assertEqual(step["connect"]["host"], "gitlab.example.com")
 
     def test_the_gitlab_step_offers_no_adoption_without_a_token_anywhere(self):

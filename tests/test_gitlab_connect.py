@@ -1,8 +1,10 @@
 """Connecting GitLab from the page: the logins it may adopt, and the write it performs.
 
-The token is the thing to be careful with here: the page is told which logins exist and whether
+Two things are being held still here. The token: the page is told which logins exist and whether
 each has a token, never the token itself, and the only place the value goes is the profile's .env
-through Hermes' own credential writer.
+through Hermes' own credential writer. And the *read* side: the catalogue's rule 11 says a plugin
+does not read .env files or another tool's login, so the fixtures below plant exactly those files
+and assert that nothing in the setup payload or the source list comes from them.
 """
 import importlib.util
 import json
@@ -28,16 +30,15 @@ class GitlabConnectTest(unittest.TestCase):
         for name in ("default", "beta-cloud"):
             home = self.root if name == "default" else self.root / "profiles" / name
             home.mkdir(parents=True, exist_ok=True)
+        # a credential store another profile owns: planted so the tests can prove it is never read
         (self.root / "profiles" / "beta-cloud" / ".env").write_text(
-            "GITLAB_HOST=gitlab.example.com\nGITLAB_TOKEN=glpat-from-that-profile\n")
+            "GITLAB_HOST=gitlab.decoy\nGITLAB_TOKEN=glpat-DECOY-profile-env\n")
         self.secret = {"GITLAB_HOST": "gitlab.example.com", "GITLAB_TOKEN": "glpat-here"}
         self.wrote, self.env_wrote = [], []
         patches = [
             mock.patch.object(api, "get_default_hermes_root", lambda: self.root),
             mock.patch.object(api, "get_hermes_home", lambda: self.root),
-            mock.patch.object(api.kanban_db, "list_profiles_on_disk", lambda: ["beta-cloud", "default"]),
             mock.patch.object(api, "get_secret", lambda name: self.secret.get(name, "")),
-            mock.patch.object(api, "_glab_login", lambda: {}),
             mock.patch.object(api, "gitlab_state", lambda fresh=False: {"host": "gitlab.example.com",
                                                                        "has_token": True, "ok": True,
                                                                        "user": "someone", "error": ""}),
@@ -53,40 +54,48 @@ class GitlabConnectTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_the_page_sees_which_logins_exist_but_never_a_token(self):
+    def test_the_page_sees_this_profiles_login_but_never_a_token(self):
         sources = api.gitlab_sources()
-        ids = [s["id"] for s in sources]
-        self.assertIn("env", ids)
-        self.assertIn("profile:beta-cloud", ids)
+        self.assertEqual([s["id"] for s in sources], ["env"])
+        self.assertEqual(sources[0], {"id": "env", "label": "this profile's environment",
+                                      "host": "gitlab.example.com", "has_token": True})
         self.assertTrue(all("token" not in s for s in sources))
-        self.assertEqual([s for s in sources if s["id"] == "env"][0],
-                         {"id": "env", "label": "this profile's environment",
-                          "host": "gitlab.example.com", "has_token": True})
         # the JSON the page receives is the same, token-free
         self.assertNotIn("glpat", json.dumps(api.setup()))
 
+    def test_another_profiles_env_file_is_never_read_or_offered(self):
+        # rule 11: a profile's .env is Hermes' credential store, and Hermes is what reads it. The
+        # decoy planted in setUp holds both a host and a token; neither may reach the page, and the
+        # readers that used to parse it must not come back.
+        self.secret = {}
+        with mock.patch.object(api, "_gitlab_host", lambda: ""):
+            payload = json.dumps(api.setup())
+            sources = api.gitlab_sources()
+        self.assertNotIn("DECOY", payload)
+        self.assertNotIn("gitlab.decoy", payload)
+        self.assertEqual(sources, [])
+        for gone in ("_env_logins", "_glab_login"):
+            self.assertFalse(hasattr(api, gone), f"{gone} is back: a plugin must not read credential stores")
+
     def test_a_host_with_no_token_is_still_named_as_a_source(self):
         self.secret = {}
-        (self.root / "profiles" / "beta-cloud" / ".env").write_text("")
         (self.root / "config.yaml").write_text(
             "plugins:\n  entries:\n    gitlab-mr:\n      settings:\n        gitlab_host: gitlab.example.com\n")
         self.assertEqual(api.gitlab_sources(), [{"id": "gitlab-mr", "label": "the gitlab-mr plugin",
                                                  "host": "gitlab.example.com", "has_token": False}])
 
-    def test_a_token_only_source_is_offered_for_the_host_already_configured(self):
-        # this is the common case on a fleet: a profile .env with a token and no host, and the
-        # plugin already pointed at one
-        self.secret = {}
-        (self.root / "profiles" / "beta-cloud" / ".env").write_text("GITLAB_TOKEN=glpat-only\n")
+    def test_a_token_with_no_host_is_offered_for_the_host_already_configured(self):
+        # GITLAB_TOKEN set with no GITLAB_HOST is a login for the host this plugin is already on
+        self.secret = {"GITLAB_TOKEN": "glpat-only"}
         with mock.patch.object(api, "_gitlab_host", lambda: "gitlab.example.com"):
             sources = api.gitlab_sources()
-        self.assertEqual([s["host"] for s in sources], ["gitlab.example.com"])
-        self.assertTrue(sources[0]["has_token"])
+        self.assertEqual(sources, [{"id": "env", "label": "this profile's environment",
+                                    "host": "gitlab.example.com", "has_token": True}])
 
-    def test_using_a_source_writes_the_plugins_own_settings(self):
-        out = api.setup_gitlab({"source": "profile:beta-cloud"})
+    def test_adopting_the_environments_login_writes_the_plugins_own_settings(self):
+        out = api.setup_gitlab({"source": "env"})
         self.assertEqual(self.wrote, [{"gitlab_host": "gitlab.example.com"}])
-        self.assertEqual(self.env_wrote, [("OPERATIONS_GITLAB_TOKEN", "glpat-from-that-profile")])
+        self.assertEqual(self.env_wrote, [("OPERATIONS_GITLAB_TOKEN", self.secret["GITLAB_TOKEN"])])
         self.assertEqual(out["wrote"], ["gitlab_host", "gitlab_token"])
         self.assertTrue(out["gitlab"]["ok"])
         self.assertNotIn("glpat", json.dumps(out))
@@ -102,12 +111,13 @@ class GitlabConnectTest(unittest.TestCase):
         (self.root / "config.yaml").write_text(
             "plugins:\n  entries:\n    gitlab-mr:\n      settings:\n        gitlab_host: gitlab.example.com\n")
         self.secret = {}
-        (self.root / "profiles" / "beta-cloud" / ".env").write_text("")
         cases = [
             ({"source": "nobody"}, 404),
-            ({"source": "gitlab-mr"}, 409),          # a host but no token: not adoptable
-            ({"host": "gitlab.example.com"}, 400),   # no token
-            ({"token": "glpat-x"}, 400),             # no host
+            ({"source": "profile:beta-cloud"}, 404),  # a profile .env is not a source any more
+            ({"source": "glab"}, 404),                # neither is the glab CLI's own config
+            ({"source": "gitlab-mr"}, 409),           # a host but no token: not adoptable
+            ({"host": "gitlab.example.com"}, 400),    # no token
+            ({"token": "glpat-x"}, 400),              # no host
             ({"host": "https://gitlab.example.com", "token": "glpat-x"}, 400),
         ]
         for body, code in cases:

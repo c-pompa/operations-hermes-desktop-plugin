@@ -14,7 +14,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1] / "plugins" / "operations"
 JS = (ROOT / "desktop" / "plugin.js").read_text()
 START = JS.index("const ROLECTL_TOASTED")
-SLICE = JS[START:JS.index("// The login this machine already holds", START)]
+# end on the next function declaration, not on a comment: rewording a banner silently moved this
+# slice's boundary once already, and the slice is what the toast tests actually execute
+SLICE = JS[START:JS.index("function gitlabConnect(s)", START)]
 
 HARNESS = """
 const PATH = '/operations'

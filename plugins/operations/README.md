@@ -331,12 +331,13 @@ checklist on the Notifications tab, and an "N setup steps left" link on Overview
 - the metrics collector and the kanban board
 - a GitLab login: Merge requests, merged changes and a fleet standard kept in a GitLab repo read
   nothing without one. The step says which half is missing (host or token) and when the host is
-  set but does not answer, **and it can be finished in the page**: it offers the logins this
-  machine already holds (this profile's environment, another profile's `.env`, the `gitlab-mr`
-  plugin's host, the `glab` CLI) as one press each, or takes a host and token typed into a masked
+  set but does not answer, **and it can be finished in the page**: it offers the login this profile
+  already carries in its environment (read through Hermes' secret scope) and the host the
+  `gitlab-mr` plugin names, as one press each, or takes a host and token typed into a masked
   field. It writes the plugin's own settings — the host through the plugin-settings writer, the
   token through the `.env` credential route under `OPERATIONS_GITLAB_TOKEN` — and never sends a
-  token back to the page
+  token back to the page. It reads no other credential store: a login that exists only in another
+  profile's `.env` or in the `glab` CLI's config is typed into the step instead
 - the Conformance project and what happens when a host drifts
 - optionally, Discord alerts
 
@@ -396,7 +397,7 @@ All optional, in Capabilities > Plugins > Operations (the gear), stored under
 | `<hermes root>/plugin-data/gitlab-mr/device-aliases.json` | pairing hosts with pool devices |
 | profile `config.yaml` files | where the plugin is enabled, and which profiles can change router roles (`rolectl-mcp` with writes on) |
 | the model router's status endpoint | router roles: which models are loaded and with how much context |
-| other profiles' `.env`, the `gitlab-mr` plugin's settings and `~/.config/glab-cli/config.yml` | which GitLab logins already exist on this machine, so Connect GitLab can offer them; only the host and whether a token is there are shown |
+| this profile's environment, and the `gitlab-mr` plugin's settings (host only) | which GitLab logins Connect GitLab can offer; only the host and whether a token is there are shown. Another profile's `.env` and the `glab` CLI's config are **not** read: they are credential stores, not configuration |
 | LM Studio's local server (`LMSTUDIO_URL`, default `http://127.0.0.1:1234`) | which of a role's candidates it could load |
 
 Shell commands are only `git status`, `git rev-parse` and `git ls-files` in checked project folders
