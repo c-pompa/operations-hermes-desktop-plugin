@@ -6,7 +6,7 @@ The plugin's version lives in three places that must agree: `plugins/operations/
 version below has no section here, so `hermes plugins update` and the catalogue can always say
 which build an install is on.
 
-## 0.4.0
+## 0.3.5
 
 **Operations no longer reads another app's database.** Until now every request, error, host and
 host-check number on this page came from `~/.hermes/metrics/metrics.db` — a file whose schema
