@@ -17,7 +17,9 @@ Conformance tab's fix card for each host whose newest report fails a check, the 
 import importlib.util
 import json
 import logging
+import os
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -25,6 +27,14 @@ from hermes_cli import kanban_db
 from hermes_cli.kanban_db_connect import connect_closing
 
 START_AT = re.compile(r"\(operations:(\d+)\)")
+# Where the heartbeat is written, so the dashboard process can read what this one did. The shared
+# root, like the plugin's other plugin-data files (dashboard/plugin_api.py resolves the same way).
+HERMES_ROOT = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
+HEARTBEAT_FILE = HERMES_ROOT / "plugin-data" / "operations" / "heartbeat.json"
+# The kanban dispatcher ticks about once a minute; two missed intervals (this long) means the tick
+# is not ours and the sweep runs on the plugin's own timer instead.
+TICK_INTERVAL_S = 60
+OWN_TIMER_CHECK_S = 30
 
 
 def start_at(conn, task_id):
@@ -123,9 +133,13 @@ def _drift(ctx, dry_run=False, **_):
     if not (ctx.get_config("conformance_project") or api._LOCAL_STANDARD.is_file()):
         return
     ctx.state.set("drift.at", time.time())
-    if not api._METRICS_DB.exists() or not api._KANBAN_DB.exists():
+    read = _metrics_read(api)
+    if read is None or not api._KANBAN_DB.exists():
         return
-    m = api._ro(api._METRICS_DB)
+    path, source = read
+    if source == "none":
+        return  # nothing to read host checks from; the page reports that
+    m = api._ro(path)
     try:
         hosts = api.host_results(m, {}, time.time())
     finally:
@@ -144,10 +158,139 @@ def _drift(ctx, dry_run=False, **_):
     ctx.state.set("drift.last", last)
 
 
+def read_heartbeat():
+    try:
+        data = json.loads(HEARTBEAT_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_heartbeat(**fields):
+    """Record what the last sweep did, for the page. Never fatal: a heartbeat it cannot write is
+    reported on the plugin's status, not raised into a hook."""
+    data = read_heartbeat()
+    data.update(fields)
+    try:
+        HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = HEARTBEAT_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        tmp.replace(HEARTBEAT_FILE)
+        return True
+    except OSError as exc:
+        log.warning("operations: could not write the heartbeat file: %s", exc)
+        return False
+
+
+def tick_due(last_tick, now, interval=TICK_INTERVAL_S):
+    """No dispatcher tick within two intervals: the sweep must run on the plugin's own timer."""
+    return last_tick is None or now - last_tick >= 2 * interval
+
+
+def is_real_context(ctx):
+    """True only for the context Hermes itself hands a plugin (a test's stand-in is not one)."""
+    try:
+        from hermes_cli.plugins import PluginContext
+    except Exception:
+        return False
+    return isinstance(ctx, PluginContext)
+
+
+def _metrics_read(api):
+    """The store host checks are read from: the plugin's own store by default, the fleet DB as the
+    fallback (dashboard/plugin_api.py decides), or None when there is nothing to read."""
+    resolve = getattr(api, "metrics_source", None)
+    if resolve is not None:
+        try:
+            return resolve()
+        except Exception as exc:
+            log.warning("operations: could not resolve the metrics store: %s", exc)
+    return (api._METRICS_DB, "metricsdash") if api._METRICS_DB.exists() else None
+
+
+def _collect(dry_run=False, **_):
+    """Run the own-store collector (the dashboard half owns the code). A failure here is logged and
+    also lands in the collector's own status, which GET /storage reports: never a silent catch."""
+    if dry_run:
+        return
+    try:
+        _dashboard_api().collect_once(kind="tick")
+    except Exception as exc:
+        log.warning("operations: metrics collection failed: %s", exc)
+
+
+def sweep(ctx, by, now=None):
+    """One alert + drift + collection sweep, marked with what ran it ("tick" | "own-timer")."""
+    now = time.time() if now is None else now
+    _collect()
+    _alert(ctx)
+    _drift(ctx)
+    write_heartbeat(last_sweep=now, by=by)
+    return by
+
+
+def _on_heartbeat_tick(ctx, dry_run=False, **_):
+    """A kanban dispatcher tick arrived: record it and sweep. The page then reads "heartbeat: tick"."""
+    if dry_run:
+        return None
+    now = time.time()
+    try:
+        ctx.state.set("heartbeat.last_tick", now)
+    except Exception as exc:
+        log.warning("operations: could not record the dispatcher tick: %s", exc)
+    return sweep(ctx, "tick", now)
+
+
+def _heartbeat(ctx, dry_run=False, **_):
+    """The fallback sweep, on the plugin's own timer: only when the dispatcher tick has gone quiet
+    for two intervals. Marks the page "heartbeat: own timer" so the difference is visible."""
+    if dry_run:
+        return None
+    now = time.time()
+    last_tick = ctx.state.get("heartbeat.last_tick")
+    if last_tick is not None and not tick_due(last_tick, now):
+        return None
+    return sweep(ctx, "own-timer", now)
+
+
+_OWN_TIMER_STARTED = False
+
+
+def start_own_timer(ctx):
+    """A small daemon timer for hosts whose kanban dispatcher never ticks (no board).
+
+    Not a collector daemon: it only decides, every OWN_TIMER_CHECK_S, whether the tick has gone
+    quiet, and then runs the same sweep the tick would have run.
+    """
+    global _OWN_TIMER_STARTED
+    if _OWN_TIMER_STARTED or os.environ.get("OPERATIONS_HEARTBEAT_TIMER") == "0":
+        return
+    _OWN_TIMER_STARTED = True
+
+    def loop():
+        while True:
+            time.sleep(OWN_TIMER_CHECK_S)
+            try:
+                _heartbeat(ctx)
+            except Exception as exc:  # the timer must outlive any one bad sweep
+                log.warning("operations: own-timer heartbeat failed: %s", exc)
+
+    threading.Thread(target=loop, name="operations-heartbeat", daemon=True).start()
+
+
 def register(ctx):
     ctx.register_hook("on_kanban_dispatch_tick", _on_tick)
     ctx.register_hook("on_kanban_dispatch_tick", lambda **kw: _alert(ctx, **kw))
     ctx.register_hook("on_kanban_dispatch_tick", lambda **kw: _drift(ctx, **kw))
+    # The heartbeat rides the same tick, but it also has to survive the tick never arriving: see
+    # _heartbeat / start_own_timer.
+    ctx.register_hook("on_kanban_dispatch_tick", lambda **kw: _on_heartbeat_tick(ctx, **kw))
+    if is_real_context(ctx):
+        # Only a real Hermes host turns the collector on: importing the dashboard half in a test
+        # must never tail, or write to, a real install.
+        api = _dashboard_api()
+        api.enable_collection()
+        start_own_timer(ctx)
     # Its own model slot, so Activity summaries (dashboard/plugin_api.py, opt-in) run on a small
     # model the user picks rather than the main one.
     ctx.register_auxiliary_task(

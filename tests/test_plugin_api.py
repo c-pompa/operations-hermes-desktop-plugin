@@ -100,7 +100,10 @@ class OverviewTest(unittest.TestCase):
         self.assertFalse(any("ai:api" in t for t in texts))
         self.assertTrue(any(t.startswith("mbp has sent no host stats") for t in texts))
         self.assertIn("Flaky job failed 3 times in a row (delta-harness)", texts)
-        self.assertEqual(api.attention_route(), {"items": items, "errors": {}})
+        out = api.attention_route()
+        self.assertEqual({k: out[k] for k in ("items", "errors")}, {"items": items, "errors": {}})
+        # no own store here, so the payload says it served the fleet metrics.db
+        self.assertEqual(out["metrics_source"], "metricsdash")
         self.assertIn("host:mbp", [i["key"] for i in items])
         self.assertEqual(len({i["key"] for i in items}), len(items))
 

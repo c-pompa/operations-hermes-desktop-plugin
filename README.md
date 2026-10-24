@@ -383,24 +383,50 @@ All optional, in Capabilities > Plugins > Operations (the gear), stored under
 | Discord alerts | `alert_target` | empty | `discord`, `discord:<channel>`, or any `hermes send` target |
 | When a host drifts | `drift_action` | `button` | `button` offers a fix card or "I'll run it"; `automatic` files and starts the card for `drift_profile` at most once a day per host; `off` shows the checks only |
 | Profile for automatic fix cards | `drift_profile` | empty | who works the automatic cards |
+| Metrics retention | `metrics_retention_days` | `30` | how long the plugin's own metrics store keeps records: `30`, `60`, `90`, or `0` for forever. Pruned on each collector pass; the Notifications tab shows current size and what each option projects to |
 
 - **Set once on default**: a setting the default profile has applies to every profile that leaves
   it empty, and the checklist says "Set in the default profile". The gateway still reads each
   profile's own Discord alerts and automatic fix card settings, so those happen once.
-- **Host results** come from the `conformance_results` table in `metrics.db`, written by the
-  metrics forwarder on each host once its `CONFORMANCE_STANDARD` points at a copy of the standard
-  ([hermes-metrics-dash](https://github.com/c-pompa/hermes-metrics-dash) `host_checks.py`). A
-  GitLab standard's CI job `standard` must publish `conformance-report.json`. A host silent for 25
-  minutes shows as stale, and a result whose ingest token could not vouch for the host is marked
-  unverified.
+- **Host results** come from the `conformance_results` table in this plugin's own store (see
+  [Data](#data)); when the plugin has collected nothing yet it reads the same table from
+  hermes-metrics-dash's `metrics.db`, written there by its forwarder on each host once its
+  `CONFORMANCE_STANDARD` points at a copy of the standard ([hermes-metrics-dash](https://github.com/c-pompa/hermes-metrics-dash)
+  `host_checks.py`). A GitLab standard's CI job `standard` must publish `conformance-report.json`.
+  A host silent for 25 minutes shows as stale, and a result whose ingest token could not vouch for
+  the host is marked unverified.
 
 ## Data
 
-**Reads** (all read-only)
+### Self-sufficiency
+
+Operations keeps its **own metrics store** at `<hermes root>/metrics/operations.db` (WAL, versioned
+schema) and fills it from the same local files the fleet's metrics forwarder tails: request and
+MoA lines, guardrail lines in `agent.log`, the model router's request log and ClientGate's usage
+log, plus this host's CPU/memory samples and a local conformance check. Byte offsets persist, so a
+restart neither drops nor duplicates. Benchmark and harness data is not collected.
+
+- The own store is the **default source**, including in tests. hermes-metrics-dash's `metrics.db`
+  is a **fallback read only** when the own store is missing or empty, and Operations never writes
+  it: one writer per store. Every payload names its source
+  (`metrics_source: operations | metricsdash | none`).
+- Collection is incremental on the kanban dispatcher tick and lazily before the routes that read
+  metrics; there is no daemon thread. When no dispatcher tick arrives within two intervals
+  (~120 s) — a host with no board — the alert sweep runs on the plugin's own 60 s timer and the
+  page says **heartbeat: own timer** instead of **heartbeat: dispatcher tick**.
+- A failing source counts consecutive failures, keeps the last error and when the run began, backs
+  off and records its recovery; the states show under Needs attention and on the storage section.
+- When hermes-metrics-dash answers on `http://127.0.0.1:8899/api/about` (`METRICS_DASH_URL` to point
+  elsewhere), its revision and capabilities are shown and its overlapping views are linked
+  instead of duplicated. When it does not answer, Operations serves its own store and does not
+  alert on its absence.
+
+**Reads**
 
 | Source | For |
 | --- | --- |
-| `<hermes root>/metrics/metrics.db` ([hermes-metrics-dash](https://github.com/c-pompa/hermes-metrics-dash)) | requests, errors, hosts, conformance results |
+| `<hermes root>/metrics/operations.db` (this plugin's own store) | requests, errors, hosts, conformance results, health findings |
+| `<hermes root>/metrics/metrics.db` ([hermes-metrics-dash](https://github.com/c-pompa/hermes-metrics-dash), **fallback only**) | requests, errors, hosts, conformance results when the own store is empty |
 | the kanban board | cards, runs and handoffs |
 | GitLab | merge requests, pipelines, the fleet standard. A GET answer is reused for 30 seconds, so a page polling every 30 s does not ask again for the same pipelines; a 429 is waited out once when GitLab says the wait is short and otherwise reported with its `Retry-After` |
 | `<hermes root>/plugin-data/gitlab-mr/device-aliases.json` | pairing hosts with pool devices |
@@ -424,7 +450,8 @@ and nothing is created.
   plugin-settings writer and `gitlab_token` through the `.env` credential route, once, for the
   profile you are on
 - its own files under `<hermes root>/plugin-data/operations/`: `roles.json`, `summaries.json`,
-  `fixes.json`
+  `fixes.json`, and the collector's byte offsets
+- its own metrics store, `<hermes root>/metrics/operations.db` (never the fleet's `metrics.db`)
 
 **Package** `plugins/operations/`:
 

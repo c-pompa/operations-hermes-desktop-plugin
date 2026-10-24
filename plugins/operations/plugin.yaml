@@ -1,5 +1,5 @@
 name: operations
-version: 0.3.4
+version: 0.4.0
 manifest_version: 2
 requires_hermes: ">=0.21.5"
 description: >-
@@ -82,3 +82,13 @@ config_schema:
     default: ""
     label: Profile for automatic fix cards
     description: The profile that works the cards filed when "When a host drifts" is automatic.
+  metrics_retention_days:
+    type: int
+    default: 30
+    choices: [30, 60, 90, 0]
+    label: Metrics retention
+    description: >-
+      How long Operations keeps what it collects in its own store
+      (~/.hermes/metrics/operations.db). 0 keeps everything forever. The Notifications tab
+      shows the store's current size and what each option projects to; this is only about
+      Operations' own store, never the metrics dashboard's metrics.db.

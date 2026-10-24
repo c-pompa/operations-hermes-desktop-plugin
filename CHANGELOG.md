@@ -6,6 +6,48 @@ The plugin's version lives in three places that must agree: `plugins/operations/
 version below has no section here, so `hermes plugins update` and the catalogue can always say
 which build an install is on.
 
+## 0.4.0
+
+**Operations no longer reads another app's database.** Until now every request, error, host and
+host-check number on this page came from `~/.hermes/metrics/metrics.db` — a file whose schema
+belongs to hermes-metrics-dash and which its forwarder fills. A change over there broke this page
+silently, and if the dashboard or its forwarder stopped, the page went empty.
+
+Operations now keeps **its own store**, `~/.hermes/metrics/operations.db`, and fills it itself from
+the same local sources the fleet forwarder tails: `metrics/requests.jsonl`, `metrics/moa-refs.jsonl`,
+the guardrail lines in `logs/agent.log`, `logs/model-router-requests.jsonl` and
+`logs/clientgate-usage.jsonl`, plus this host's own CPU/memory samples, LM Studio pool snapshots,
+gateway state changes and a local conformance check. Byte offsets persist, so a restart neither
+drops nor duplicates; an exact re-delivery collapses on a dedup key. Benchmark and harness data —
+83% of the fleet database — is simply not collected.
+
+- **The own store is the default everywhere**, including in tests. hermes-metrics-dash's
+  `metrics.db` is now a **fallback read only** (a fresh install that has not collected yet), and it
+  is never written: one writer per store, always. Every payload says which store served it
+  (`metrics_source: operations | metricsdash | none`), and the Overview says so on the page when it
+  is not `operations`.
+- **Collection runs on the plugin's own clock, not a daemon**: one incremental pass on each kanban
+  dispatcher tick, and a cheap offset-persisted tail before the routes that read metrics. A host
+  with no board gets no dispatcher tick at all — so the alert sweep now tracks the last tick and,
+  when none has arrived within two intervals, runs on the plugin's own timer and marks the page
+  **heartbeat: own timer** (the page distinguishes it from **heartbeat: dispatcher tick**).
+- **Retention is a user decision, shown with real numbers.** The new `metrics_retention_days`
+  setting (30 default / 60 / 90 / 0 = forever) is applied by the collector on its pass, and the
+  Notifications tab has a **Metrics storage** section with the store's current size, a per-table
+  breakdown and what each option projects to (~1.6 MB/day for records). You pick it there.
+- **Recognition, not collision.** Operations probes `http://127.0.0.1:8899/api/about`
+  (`METRICS_DASH_URL` to point elsewhere), cached for five minutes. When the metrics dashboard
+  answers, its revision and capabilities are surfaced and its views are linked from where they
+  overlap (Overview and Activity) instead of being duplicated; when it does not answer, Operations
+  simply serves its own store. Its absence is not an error and raises no alert.
+- **A failing collector path is never silent.** Every source and probe counts consecutive
+  failures, keeps the last error and when the run began, backs off, and records its recovery. Those
+  states ride the same store's `health_findings`, so a source that keeps failing shows up under
+  Needs attention as well as on the storage section.
+
+The Conformance tab's host checks, the alert/heartbeat sweep and the drift cards all read the own
+store now, and the catalog's note about depending on another app is gone.
+
 ## 0.3.4
 
 **A failed model call now says what it is and what to do about it.** The Overview's Errors listed a

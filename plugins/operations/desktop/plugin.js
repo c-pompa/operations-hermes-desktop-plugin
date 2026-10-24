@@ -42,7 +42,9 @@
  *   POST /trace/{session}/explain -> { text, model, provider, errors } (written on request by the summaries
  *                             model; needs the activity_summaries setting on, else 403)
  *   GET /topology?hours=N -> { hosts (with drift), gateways, edges (with models), served, timeline (replay), router, errors }
- *   GET /attention        -> { items: the attention list alone, errors } (the alert poll)
+ *   GET /attention        -> { items: the attention list alone, metrics_source, heartbeat, errors } (the alert poll)
+ *   GET /storage          -> { mb, tables, projections, retention_days, options, metrics_source, metrics_dash, heartbeat, collector, errors }
+ *   POST /storage/retention {days: 30|60|90|0} -> the same report, after saving the setting
  *   GET /assignees        -> { assignees: profile names }
  *   POST /attention/fix {key, title, body, profile} -> a kanban card for one alert, started now: { ok, card, existing, status, started, warning }
  *   GET /models/role?name= -> { role, min_context, candidates, lmstudio, repoint, agent } (read-only: what an
@@ -1683,6 +1685,8 @@ function ActivityPage() {
   const log = useActivity(hours)
   const changes = useChanges(hours)
   const sums = useSummaries(hours, log.data?.summaries)
+  // the metrics dashboard's Activity/host views overlap with this one: link to it when it is here
+  const { data: setup } = useSetup()
   if (log.isError) return jsx('div', { className: 'p-4', children: muted('Activity unavailable: the /api/plugins/operations backend did not respond.') })
   if (log.isLoading || !log.data) return jsx('div', { className: 'p-4', children: jsx(Skeleton, { className: 'h-48 w-full' }) })
   const changeItems = (changes.data?.items || []).map(c => ({
@@ -1712,6 +1716,7 @@ function ActivityPage() {
           jsx('h2', { className: 'text-sm font-semibold', children: 'Activity' }),
           jsx('span', { className: 'text-[0.6875rem] text-(--ui-text-quaternary)', children: 'grouped by hour · select an entry for its raw lines' }),
           jsx('span', { className: 'ml-auto' }),
+          jsx(MetricsDashLink, { md: setup?.metrics_dash }),
           jsx(RangePicker, { hours, onChange: setHours })
         ]
       }),
@@ -5008,8 +5013,12 @@ function setupSteps(s) {
         : mine.state === 'off'
           ? `${s.profile || 'default'} lists Operations under plugins: disabled, so it stays hidden there. Remove it from that list in ${s.profile === 'default' ? '~/.hermes/config.yaml' : `~/.hermes/profiles/${s.profile}/config.yaml`}, then restart Hermes Desktop.`
           : `Not on in ${s.profile || 'default'}: add "- operations" under plugins: enabled: in ${s.profile === 'default' || !s.profile ? '~/.hermes/config.yaml' : `~/.hermes/profiles/${s.profile}/config.yaml`}, then restart Hermes Desktop.` },
-    { id: 'metrics', done: s.metrics, title: 'Connect the metrics collector',
-      text: s.metrics ? 'metrics.db found.' : 'No metrics.db under ~/.hermes/metrics yet. Install hermes-metrics-dash (github.com/c-pompa/hermes-metrics-dash) on this machine and its forwarder on each host; until then requests, hosts and the model pool read as empty.' },
+    { id: 'metrics', done: s.metrics, title: 'Start collecting metrics',
+      text: s.metrics
+        ? (s.metrics_source === 'operations'
+          ? 'Operations is collecting into its own store (~/.hermes/metrics/operations.db); the metrics dashboard is optional.'
+          : `Reading the metrics dashboard's metrics.db (${s.metrics_source}); Operations has collected nothing into its own store yet.`)
+        : 'Nothing collected yet. Operations tails ~/.hermes/metrics/requests.jsonl and the model router / ClientGate logs itself once the gateway runs; until then requests, hosts and the model pool read as empty. hermes-metrics-dash is optional: it adds its own pages, and its metrics.db is read only as a fallback.' },
     { id: 'kanban', done: s.kanban, title: 'Create the kanban board',
       text: s.kanban ? 'Board found.' : 'No kanban board yet. Run hermes kanban init (or open the Kanban page) so cards can be handed to profiles and fix cards can be filed.' },
     { id: 'gitlab', done: !!(s.gitlab && s.gitlab.ok), title: 'Connect GitLab',
@@ -5238,6 +5247,9 @@ function OverviewPage() {
   const { data, isLoading, isError, refetch, dataUpdatedAt } = useOverview(hours)
   // the day strip marks today's changes whatever window is picked
   const todayChanges = useChanges(24).data?.items || []
+  // whether the alert sweep is on the dispatcher tick or Operations' own timer, and whether the
+  // metrics dashboard is here to link to (/setup carries both; no extra poll)
+  const { data: setup } = useSetup()
 
   if (isError)
     return jsx(ErrorState, {
@@ -5264,6 +5276,8 @@ function OverviewPage() {
           jsx('h2', { className: 'text-sm font-semibold', children: 'Overview' }),
           jsx(RangePicker, { hours, onChange: setHours }),
           jsx(SetupLink, {}),
+          jsx(HeartbeatMark, { hb: setup?.heartbeat }),
+          jsx(MetricsDashLink, { md: setup?.metrics_dash }),
           jsxs('span', {
             className: 'ml-auto flex items-center gap-1.5 text-[0.6875rem] text-(--ui-text-quaternary)',
             style: { fontFamily: MONO },
@@ -5273,6 +5287,9 @@ function OverviewPage() {
         ]
       }),
       err.metrics ? muted(`No metrics collector data (${err.metrics}): requests, errors, hosts and the model pool read as empty.`) : null,
+      data.metrics_source && data.metrics_source !== 'operations'
+        ? muted(`Metrics read from the ${metricsSourceLabel(data.metrics_source)}; Operations is not serving its own store yet.`)
+        : null,
       err.kanban ? muted(`No kanban board (${err.kanban}): task counts and events read as empty.`) : null,
       err.vitals ? muted(`Vitals unavailable: ${err.vitals}`) : data.vitals ? jsx(Vitals, { v: data.vitals, hours, today: data.today || [], hosts: data.hosts }) : null,
       jsx(Section, {
@@ -5626,6 +5643,7 @@ function NotificationsPage({ onRead }) {
       ] }),
       jsx(SetupChecklist, {}),
       jsx(PageCopyWarning, {}),
+      jsx(StorageSection, {}),
       // A poll that cannot read Needs attention says so here, with the moment it started: the
       // alternative is a page that looks quiet because it is deaf.
       health ? jsxs('div', {
@@ -5782,6 +5800,140 @@ function OperationsPage() {
       ]
       })
     })
+  })
+}
+
+// --- metrics store --------------------------------------------------------------------
+
+// Self-sufficiency (docs/self-sufficiency.md): Operations keeps its own metrics store and fills
+// it from the same local sources the fleet forwarder reads. The metrics dashboard's metrics.db is
+// a fallback read only, never written. Everything here is a pure helper so the same rules can be
+// run under node (tests), plus the small components that render them.
+
+// Which store served the numbers. The page must be able to say this: an empty page that does not
+// know whether it read its own store, another app's database, or nothing at all is a page that
+// lies by omission.
+const METRICS_SOURCE_LABEL = {
+  operations: 'own store',
+  metricsdash: 'metrics dashboard db (fallback)',
+  none: 'no store yet'
+}
+const metricsSourceLabel = src => METRICS_SOURCE_LABEL[src] || 'unknown source'
+
+// The alert sweep rides the kanban dispatcher tick; when that tick stops arriving (a host with no
+// board) Operations runs it on its own timer. Those are different promises and the page says which.
+function heartbeatLabel(hb) {
+  if (!hb || !hb.mode) return 'heartbeat: unknown'
+  if (hb.mode === 'own-timer') return 'heartbeat: own timer'
+  if (hb.mode === 'tick') return 'heartbeat: dispatcher tick'
+  return 'heartbeat: none'
+}
+const heartbeatTone = hb => (!hb || hb.mode === 'none') ? 'bad' : (hb.mode === 'own-timer' ? 'warn' : 'good')
+
+// The metrics dashboard answers: offer its views instead of duplicating them. Absent is not an
+// error (Operations collects on its own), so it is simply no link.
+const metricsDashLink = md => (md && md.present && md.link)
+  ? { url: md.link, label: `Open in Metrics Dashboard${md.revision ? ` (${md.revision})` : ''}` }
+  : null
+
+// The storage section's rows: current size, per table, and what each retention option projects to.
+function storageRows(st) {
+  if (!st) return []
+  const rows = [{ label: 'store', value: `${st.mb ?? 0} MB`, note: st.store || '' }]
+  for (const t of st.tables || []) rows.push({ label: t.table, value: `${t.mb ?? 0} MB`, note: `${t.rows ?? 0} rows` })
+  for (const p of st.projections || []) {
+    rows.push({
+      label: p.days ? `keep ${p.days} days` : 'keep forever',
+      value: `~${p.projected_mb ?? 0} MB`,
+      note: p.days === 0 && p.monthly_mb ? `grows ~${p.monthly_mb} MB/month` : '',
+      chosen: p.days === st.retention_days
+    })
+  }
+  return rows
+}
+
+// A collector source that keeps failing, and one that has come back. Never silent: the same
+// numbers the backend counts (consecutive failures, last error, since-when, recovery).
+function collectorRows(c, now = Date.now()) {
+  if (!c || !c.enabled) return []
+  const rows = []
+  for (const [name, s] of Object.entries(c.sources || {})) {
+    if ((s.fails || 0) >= 3) rows.push({ bad: true, text: `${name} failed ${s.fails}× since ${new Date((s.since || 0) * 1000).toLocaleString()}: ${s.last_error || 'unknown error'}` })
+    else if (s.recovered_at && now - s.recovered_at * 1000 < 3_600_000) rows.push({ good: true, text: `${name} is reading again` })
+  }
+  return rows
+}
+
+const useStorage = () =>
+  useQuery({ queryKey: [ID, 'storage'], queryFn: () => api.rest('/storage'), staleTime: 60_000, ...RETRY })
+
+function HeartbeatMark({ hb }) {
+  if (!hb) return null
+  const title = hb.mode === 'own-timer'
+    ? `No kanban dispatcher tick for ${Math.round((hb.interval_s || 60) * 2)}s, so Operations is sweeping on its own timer.`
+    : hb.mode === 'tick'
+      ? 'The kanban dispatcher tick is running the alert sweep.'
+      : 'No alert sweep has run yet: neither a dispatcher tick nor the plugin’s own timer.'
+  return jsx('span', { title, children: jsx(Tag, { tone: heartbeatTone(hb), children: heartbeatLabel(hb) }) })
+}
+
+function MetricsDashLink({ md, className }) {
+  const link = metricsDashLink(md)
+  if (!link) return null
+  return jsx('a', { href: link.url, onClick: openOut, className: className || 'text-[0.6875rem] text-(--ui-accent) underline', children: link.label })
+}
+
+function StorageSection() {
+  const { data, isLoading, refetch } = useStorage()
+  const [busy, setBusy] = useState(false)
+  const [note, setNote] = useState(null)
+  if (isLoading || !data) return null
+  const rows = storageRows(data)
+  const collector = collectorRows(data.collector)
+  const choose = async days => {
+    setBusy(true); setNote(null)
+    try {
+      await api.rest('/storage/retention', { method: 'POST', body: { days }, timeoutMs: 20_000 })
+      await refetch()
+      setNote({ text: days ? `Keeping ${days} days; the collector prunes on its next pass.` : 'Keeping everything, forever.' })
+    } catch (e) {
+      setNote({ bad: true, text: String(e?.message || e) })
+    } finally { setBusy(false) }
+  }
+  return jsx(Section, {
+    title: 'Metrics storage',
+    count: `${data.mb ?? 0} MB${data.estimated ? ' (estimated)' : ''} · ${metricsSourceLabel(data.metrics_source)}`,
+    children: jsxs('div', { className: 'space-y-2 text-xs', children: [
+      jsxs('div', { className: 'flex flex-wrap items-center gap-2', children: [
+        jsx(HeartbeatMark, { hb: data.heartbeat }),
+        jsx(MetricsDashLink, { md: data.metrics_dash }),
+        jsx('span', { className: 'text-(--ui-text-quaternary)', children: `collector ${data.collector && data.collector.enabled ? 'on' : 'off'}` })
+      ] }),
+      jsx('div', { className: 'text-(--ui-text-quaternary)', style: { userSelect: 'text' }, children:
+        `Operations keeps its own store at ${data.store} and collects this host's sources itself. The metrics dashboard's database is never written, only read as a fallback.` }),
+      jsx('div', {
+        className: 'overflow-hidden rounded-md border border-(--ui-stroke-secondary)',
+        children: rows.map((r, i) => jsxs('div', {
+          key: `${r.label}:${i}`,
+          className: 'flex items-center gap-3 border-b border-(--ui-stroke-secondary) px-3 py-1.5 last:border-b-0',
+          style: r.chosen ? { backgroundColor: 'color-mix(in srgb, var(--ui-accent) 8%, transparent)' } : undefined,
+          children: [
+            jsx('span', { style: { fontFamily: MONO, width: '9rem', flex: 'none' }, children: r.label }),
+            jsx('span', { className: 'tabular-nums', style: { fontWeight: r.chosen ? 600 : 400 }, children: r.value }),
+            jsx('span', { className: 'min-w-0 flex-1 truncate text-(--ui-text-quaternary)', children: r.note })
+          ]
+        }))
+      }),
+      jsxs('div', { className: 'flex flex-wrap items-center gap-2', children: [
+        jsx('span', { className: 'text-(--ui-text-quaternary)', children: 'Keep metrics for:' }),
+        ...(data.options || []).map(o => jsx(Button, {
+          key: o.days, size: 'xs', variant: o.days === data.retention_days ? 'outline' : 'ghost',
+          disabled: busy, onClick: () => choose(o.days), children: o.label
+        }))
+      ] }),
+      ...collector.map((r, i) => jsx('div', { key: `c${i}`, className: 'leading-snug', style: { color: r.bad ? TONE.bad : TONE.good }, children: r.text })),
+      note ? jsx('div', { className: 'leading-snug', style: { color: note.bad ? TONE.bad : TONE.good }, children: note.text }) : null
+    ] })
   })
 }
 

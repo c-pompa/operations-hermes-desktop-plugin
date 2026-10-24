@@ -2,14 +2,18 @@
 
 GET /overview?hours=N returns everything the Overview page shows: vitals for
 the window, today's hourly strip, what needs attention, hosts with their model
-pool, and recent activity. Opens the metrics collector's
-<hermes root>/metrics/metrics.db and the kanban board with mode=ro. The only
+pool, and recent activity. Reads this plugin's OWN metrics store,
+<hermes root>/metrics/operations.db (see "Self-sufficiency" below), and the kanban board, with
+mode=ro. hermes-metrics-dash's <hermes root>/metrics/metrics.db is a read-only FALLBACK for an
+install that has not collected anything yet, and is never written. The only
 writes are the actions below: kanban cards, a GitLab merge request for a rule,
 the plugin's own files in plugin-data/operations/ (roles.json,
-summaries.json, fixes.json), and in business mode the standard's org skill. Each section is built independently, so one failing source leaves the
-others intact and its error is reported under "errors". A database that does
-not exist (no metrics collector, no kanban board yet) is replaced by an empty
-one, so its numbers read as empty and errors["metrics"] / errors["kanban"] say why.
+summaries.json, fixes.json, the collector's offsets), and its own metrics store; in business mode
+the standard's org skill. Each section is built independently, so one failing source leaves the
+others intact and its error is reported under "errors". A database that does not exist (nothing
+collected yet, no kanban board yet) is replaced by an empty one, so its numbers read as empty and
+errors["metrics"] / errors["kanban"] say why. Every payload that serves metrics data names the
+store it read: "metrics_source": "operations" | "metricsdash" | "none".
 
 GET /changes?hours=N returns what changed in the window: MRs merged on
 GitLab (read with the gitlab_token setting, or GITLAB_TOKEN) and model loads and
@@ -111,6 +115,14 @@ GET /conformance/projects?root=<folder>... checks each folder (the page passes t
 Hermes Desktop lists) over its git-tracked files against the built-in DEFAULT_REPO_RULES plus,
 when there is a fleet standard (see GET /conformance), that standard's "absent" repo rules. Read only.
 
+GET /storage returns Operations' own metrics store: its size, a per-table breakdown, what each
+retention option (30 / 60 / 90 / 0 = forever) projects to at the measured ~1.6 MB/day for records,
+the retention in force, which store a read would serve, whether the metrics dashboard answered (its
+revision and capabilities), the alert heartbeat (dispatcher tick vs the plugin's own timer), and
+every collector source's health (consecutive failures, last error, since-when, recovery). POST
+/storage/retention {"days": 30|60|90|0} saves the setting and returns the same report. Read only
+apart from that one setting write, which goes through Hermes' plugin-settings writer.
+
 GET /setup returns what a first run still needs, for the Overview page's setup checklist: each
 profile with operations on, off (listed under plugins.disabled) or missing from plugins.enabled,
 whether metrics.db and the kanban board exist, whether GitLab answers (its host, whether a token is
@@ -151,6 +163,7 @@ import json
 import math
 import os
 import re
+import socket
 import sqlite3
 import statistics
 import subprocess
@@ -183,6 +196,60 @@ _LOCAL_STANDARD = get_default_hermes_root() / "conformance" / "conformance.yaml"
 _KANBAN_DB = kanban_db_path()
 # Host name -> pool device name, kept by hand for Ops Timeline; read here, never written.
 _DEVICE_ALIASES = get_default_hermes_root() / "plugin-data" / "gitlab-mr" / "device-aliases.json"
+
+# --- self-sufficiency: Operations' own metrics store and collector ---------------------------------
+# See docs/self-sufficiency.md. The plugin keeps its OWN sqlite store and fills it from the same
+# local sources the fleet forwarder tails, with no daemon thread: one incremental, offset-persisted
+# pass per dispatcher tick and lazily before the routes that read metrics. Reading prefers this
+# store everywhere; the fleet metrics.db is a read-only FALLBACK (fresh install: own store absent
+# or empty). No path in this file ever writes to metrics.db. Benchmark and harness data, 83% of the
+# fleet DB, are deliberately not collected.
+_METRICS_ROOT = get_default_hermes_root()
+# The own store. None means "<hermes root>/metrics/operations.db", resolved by operations_db() so a
+# caller that repoints the fleet DB (the tests) repoints this too and nothing here can touch a real
+# install by accident.
+_OPERATIONS_DB: Optional[Path] = None
+# Byte offsets and per-source health, under the plugin's own plugin-data dir.
+_COLLECT_STATE = _METRICS_ROOT / "plugin-data" / "operations" / "collector-state.json"
+# The heartbeat ../__init__.py writes: whether the alert sweep rode the dispatcher tick or this
+# plugin's own timer. A file, not plugin state, so the dashboard process can read what the gateway
+# wrote.
+_HEARTBEAT = _METRICS_ROOT / "plugin-data" / "operations" / "heartbeat.json"
+# The local sources (hermes-metrics-dash forwarder.py tails the same five).
+_REQUESTS_JSONL = _METRICS_ROOT / "metrics" / "requests.jsonl"
+_MOA_REFS_JSONL = _METRICS_ROOT / "metrics" / "moa-refs.jsonl"
+_AGENT_LOG = _METRICS_ROOT / "logs" / "agent.log"
+_ROUTER_JSONL = _METRICS_ROOT / "logs" / "model-router-requests.jsonl"
+_CLIENTGATE_JSONL = _METRICS_ROOT / "logs" / "clientgate-usage.jsonl"
+# Session titles/parents/cost, read read-only and never created (missing = no enrichment).
+_SESSION_DB = _METRICS_ROOT / "state.db"
+_LMS_BIN = os.path.expanduser(os.environ.get("LMS_BIN", "~/.lmstudio/bin/lms"))
+# The metrics dashboard's HTTP surface, probed (never written) for recognition.
+_METRICS_DASH_URL = os.environ.get("METRICS_DASH_URL", "http://127.0.0.1:8899").rstrip("/")
+HOST_LABEL = os.environ.get("METRICS_HOST_LABEL", socket.gethostname().split(".")[0])
+STORE_VERSION = 1
+# records' measured steady-state growth fleet-wide (design doc: 0.5-2.6 MB/day; 1.6 is the mean).
+MB_PER_DAY = 1.6
+# The retention the user picks, and 0 = forever.
+RETENTION_OPTIONS = (30, 60, 90, 0)
+RETENTION_SETTING = "metrics_retention_days"
+RETENTION_DEFAULT = 30
+# Host reports older than this are of no use to the Conformance tab (the fleet collector's policy).
+CONFORMANCE_KEEP_DAYS = 14
+# A source that keeps failing is retried at most this often, and 3 failures in a row is a finding.
+SOURCE_BACKOFF_S = 300
+SOURCE_FAILS_TO_REPORT = 3
+DASH_PROBE_TTL_S = 300
+# The dispatcher ticks about once a minute (core); two missed intervals mean the tick is not ours.
+TICK_INTERVAL_S = 60
+# One lazy collect per five seconds at most, so a page firing six requests collects once.
+ROUTE_COLLECT_MIN_S = 5
+_CONFORMANCE_INTERVAL_S = 300
+# Collecting is OFF until the plugin is loaded in a real Hermes (../__init__.py register() calls
+# enable_collection()). A test that imports this module can therefore never tail, or write to, a
+# real install; a test that wants the collector turns it on and points the paths at its own fixture.
+_COLLECT_ENABLED = False
+_LAST_ROUTE_COLLECT = 0.0
 # host_stats arrive every 30 s; a host silent for longer than this is stale.
 STALE_S = 120
 # The forwarder's label for a platform in a running gateway's state file that an earlier gateway process
@@ -236,6 +303,8 @@ CREATE TABLE records (ts REAL, host TEXT, event TEXT, kind TEXT, platform TEXT, 
   error TEXT, label TEXT, device TEXT, cpu_load REAL, mem_used_gb REAL, mem_total_gb REAL, session_id TEXT,
   parent_session_id TEXT);
 CREATE TABLE health_findings (ts REAL, rule TEXT, sev TEXT, text TEXT, action TEXT);
+CREATE TABLE conformance_results (ts REAL, host TEXT, rule TEXT, standard TEXT, standard_rev TEXT,
+  status TEXT, value TEXT, evidence TEXT, verified INTEGER);
 """
 _EMPTY_KANBAN = """
 CREATE TABLE tasks (id TEXT, title TEXT, assignee TEXT, status TEXT, created_at INTEGER,
@@ -261,6 +330,1232 @@ def _ro_or_empty(db: Path, schema: str, errors: Dict[str, str], name: str) -> sq
     conn.row_factory = sqlite3.Row
     conn.executescript(schema)
     return conn
+
+
+# ======================================================================================
+# Own metrics store + collector (docs/self-sufficiency.md)
+# ======================================================================================
+
+_STORE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts REAL NOT NULL, host TEXT, event TEXT, kind TEXT,
+  session_id TEXT, parent_session_id TEXT, session_title TEXT, turn_id TEXT,
+  api_request_id TEXT, platform TEXT, model TEXT, provider TEXT,
+  duration_s REAL, tps REAL, input_tokens INTEGER, output_tokens INTEGER,
+  cache_read_tokens INTEGER, cache_write_tokens INTEGER, reasoning_tokens INTEGER,
+  finish_reason TEXT, error TEXT, preset TEXT, label TEXT,
+  ttft_s REAL, tps_native REAL, spec_accept_rate REAL, device TEXT,
+  cost_usd REAL, cpu_load REAL, mem_used_gb REAL, mem_total_gb REAL,
+  dedup_key TEXT, session_source TEXT, session_started_at REAL,
+  assistant_content_chars INTEGER, response_model TEXT, profile TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ops_records_dedup ON records(dedup_key);
+CREATE INDEX IF NOT EXISTS idx_ops_records_ts ON records(ts);
+CREATE INDEX IF NOT EXISTS idx_ops_records_session ON records(session_id);
+CREATE TABLE IF NOT EXISTS conformance_results (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts REAL NOT NULL, host TEXT NOT NULL, rule TEXT NOT NULL,
+  standard TEXT, standard_rev TEXT, status TEXT NOT NULL,
+  value TEXT, evidence TEXT, verified INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ops_conformance_host_rule_ts ON conformance_results(host, rule, ts);
+CREATE TABLE IF NOT EXISTS health_findings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts REAL NOT NULL, window_hours REAL, rule TEXT NOT NULL,
+  sev TEXT NOT NULL, text TEXT NOT NULL, action TEXT, beta INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_ops_health_ts ON health_findings(ts);
+"""
+
+# The columns of `records` this plugin reads, in one list so the store and the schema agree.
+STORE_RECORD_COLUMNS = (
+    "ts", "host", "event", "kind", "session_id", "parent_session_id", "session_title",
+    "turn_id", "api_request_id", "platform", "model", "provider", "duration_s", "tps",
+    "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+    "reasoning_tokens", "finish_reason", "error", "preset", "label", "ttft_s", "tps_native",
+    "spec_accept_rate", "device", "cost_usd", "cpu_load", "mem_used_gb", "mem_total_gb",
+    "dedup_key", "session_source", "session_started_at", "assistant_content_chars",
+    "response_model", "profile",
+)
+
+
+def operations_db() -> Path:
+    """The plugin's own metrics store: ``<hermes root>/metrics/operations.db``.
+
+    Resolved from the fleet DB's own location, so a caller that repoints ``_METRICS_DB`` (the
+    tests) repoints this too: nothing here can open or write a real install by accident.
+    """
+    if _OPERATIONS_DB is not None:
+        return Path(_OPERATIONS_DB)
+    root = get_default_hermes_root()
+    if Path(_METRICS_DB) != root / "metrics" / "metrics.db":
+        return Path(_METRICS_DB).parent / "operations.db"
+    return root / "metrics" / "operations.db"
+
+
+def _open_store(path: Optional[Path] = None) -> sqlite3.Connection:
+    """The own store, writable, in WAL mode (its own writer is this plugin only)."""
+    path = operations_db() if path is None else path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.Error:
+        pass  # an engine that refuses WAL (older builds) still gets a working store
+    return conn
+
+
+def store_journal_mode(conn: sqlite3.Connection) -> str:
+    try:
+        return str(conn.execute("PRAGMA journal_mode").fetchone()[0])
+    except sqlite3.Error:
+        return "unknown"
+
+
+def ensure_store(conn: Optional[sqlite3.Connection] = None) -> sqlite3.Connection:
+    """Create-or-migrate the own store and stamp its schema version. Returns the connection."""
+    conn = _open_store() if conn is None else conn
+    conn.executescript(_STORE_SCHEMA)
+    conn.execute(f"PRAGMA user_version={STORE_VERSION}")
+    conn.execute("INSERT INTO meta(key, value) VALUES('schema_version', ?)"
+                 " ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(STORE_VERSION),))
+    conn.commit()
+    return conn
+
+
+def store_schema_version(conn: sqlite3.Connection) -> Optional[int]:
+    try:
+        return int(conn.execute("PRAGMA user_version").fetchone()[0])
+    except sqlite3.Error:
+        return None
+
+
+_STORE_TABLES = ("records", "conformance_results", "health_findings")
+
+
+def _table_counts(path: Path) -> Dict[str, int]:
+    """Row count per own-store table; {} when the file is absent or unreadable."""
+    try:
+        conn = _ro(path)
+    except sqlite3.Error:
+        return {}
+    try:
+        have = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        return {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in _STORE_TABLES if t in have}
+    except sqlite3.Error:
+        return {}
+    finally:
+        conn.close()
+
+
+def metrics_source() -> Tuple[Path, str]:
+    """Which store a read serves, and its name: ``operations`` | ``metricsdash`` | ``none``.
+
+    The own store is the default. The fleet ``metrics.db`` is consulted only while the own store
+    holds nothing (a fresh install whose collector has not run yet); if neither has anything, the
+    read reports itself as "none" rather than looking empty on its own. Neither file is ever
+    written here.
+    """
+    _lazy_collect()
+    own = operations_db()
+    own_counts = _table_counts(own)
+    if own_counts and any(own_counts.values()):
+        return own, "operations"
+    fleet = Path(_METRICS_DB)
+    if fleet.exists():
+        return fleet, "metricsdash"
+    if own.exists():
+        return own, "operations"
+    return fleet, "none"
+
+
+def _empty_metrics() -> sqlite3.Connection:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(_EMPTY_METRICS)
+    return conn
+
+
+def _metrics_conn(errors: Dict[str, str], key: str = "metrics") -> Tuple[sqlite3.Connection, str]:
+    """The metrics store to read, read-only, with the source it came from.
+
+    An absent or unreadable store becomes the empty stand-in and the reason lands under
+    errors[key], exactly as before — the difference is only which file is preferred.
+    """
+    path, source = metrics_source()
+    if source == "none":
+        errors[key] = f"{path} not found"
+        return _empty_metrics(), "none"
+    try:
+        return _ro(path), source
+    except sqlite3.Error as exc:
+        errors[key] = str(exc)
+        return _empty_metrics(), "none"
+
+
+def enable_collection() -> None:
+    """Turn the collector on for this process (../__init__.py calls this when Hermes loads the
+    plugin). Off by default so importing this module never touches a real install."""
+    global _COLLECT_ENABLED
+    _COLLECT_ENABLED = True
+
+
+def collection_enabled() -> bool:
+    return _COLLECT_ENABLED
+
+
+def _lazy_collect() -> None:
+    """One cheap tail (+ prune) before a route reads metrics. Debounced, and never fatal."""
+    if not _COLLECT_ENABLED:
+        return
+    global _LAST_ROUTE_COLLECT
+    now = time.time()
+    if now - _LAST_ROUTE_COLLECT < ROUTE_COLLECT_MIN_S:
+        return
+    _LAST_ROUTE_COLLECT = now
+    try:
+        collect_once(kind="route", now=now)
+    except Exception:  # a collection pass must never break a read
+        pass
+
+
+# --- offsets, per-source health ------------------------------------------------------------
+
+def _load_collect_state() -> Dict[str, Any]:
+    try:
+        data = json.loads(_COLLECT_STATE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_collect_state(state: Dict[str, Any]) -> None:
+    _COLLECT_STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _COLLECT_STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state), encoding="utf-8")
+    tmp.replace(_COLLECT_STATE)
+
+
+def _tail_offset(stored, size: int, ino: int) -> int:
+    """Stored tail position -> byte offset. Rotation (inode change) or truncation restarts at 0."""
+    if isinstance(stored, dict):
+        if stored.get("ino") != ino or size < stored.get("offset", 0):
+            return 0
+        return int(stored.get("offset", 0))
+    offset = int(stored or 0)
+    return 0 if size < offset else offset
+
+
+def _read_new_lines(path: Path, state: Dict[str, Any], seed_eof: bool = False) -> List[dict]:
+    """New complete JSONL lines since the stored offset ([] and no state when the file is absent)."""
+    key = str(path)
+    try:
+        st = path.stat()
+    except OSError:
+        return []
+    size, ino = st.st_size, st.st_ino
+    stored = state.get(key)
+    if stored is None:
+        if seed_eof:
+            state[key] = {"ino": ino, "offset": size}
+            return []
+        offset = 0
+    else:
+        offset = _tail_offset(stored, size, ino)
+    if size == offset:
+        return []
+    with path.open("rb") as f:
+        f.seek(offset)
+        chunk = f.read(size - offset)
+    nl = chunk.rfind(b"\n")  # a trailing partial line stays unconsumed for the next pass
+    if nl == -1:
+        return []
+    rows = []
+    for raw in chunk[:nl].split(b"\n"):
+        if not raw.strip():
+            continue
+        try:
+            rows.append(json.loads(raw.decode("utf-8")))
+        except Exception:
+            continue  # corrupt line: skipped, offset still advances past it
+    state[key] = {"ino": ino, "offset": offset + nl + 1}
+    return rows
+
+
+def _read_new_text_lines(path: Path, state: Dict[str, Any]) -> List[str]:
+    """Plain-text variant for agent.log; first sight seeds at EOF (its history is not backfilled)."""
+    key = str(path)
+    try:
+        st = path.stat()
+    except OSError:
+        return []
+    size, ino = st.st_size, st.st_ino
+    stored = state.get(key)
+    if stored is None:
+        state[key] = {"ino": ino, "offset": size}
+        return []
+    offset = _tail_offset(stored, size, ino)
+    if size == offset:
+        return []
+    with path.open("rb") as f:
+        f.seek(offset)
+        chunk = f.read(size - offset)
+    nl = chunk.rfind(b"\n")
+    if nl == -1:
+        return []
+    state[key] = {"ino": ino, "offset": offset + nl + 1}
+    return [ln.decode("utf-8", errors="replace") for ln in chunk[:nl].split(b"\n") if ln.strip()]
+
+
+def _source_health(state: Dict[str, Any], name: str, ok: bool, error: str = "",
+                   now: Optional[float] = None) -> Dict[str, Any]:
+    """Consecutive failure bookkeeping for one collector path, and the recovery announcement.
+
+    Never a silent catch: a failing source keeps its count, its last error and when the run began,
+    backs off, and records when it came back.
+    """
+    now = time.time() if now is None else now
+    sources = state.setdefault("sources", {})
+    entry = sources.get(name) or {"fails": 0, "since": None, "last_error": None, "last_ok": None,
+                                 "recovered_at": None, "backoff_until": 0}
+    if ok:
+        if entry["fails"] >= SOURCE_FAILS_TO_REPORT:
+            entry["recovered_at"] = now
+        entry["fails"] = 0
+        entry["since"] = None
+        entry["last_error"] = None
+        entry["last_ok"] = now
+        entry["backoff_until"] = 0
+    else:
+        entry["fails"] = int(entry.get("fails") or 0) + 1
+        entry["since"] = entry.get("since") or now
+        entry["last_error"] = error or "unknown error"
+        entry["backoff_until"] = now + SOURCE_BACKOFF_S
+    sources[name] = entry
+    return entry
+
+
+def source_state() -> Dict[str, Any]:
+    """The collector's per-source health, for a payload that must be able to say it is not working."""
+    state = _load_collect_state()
+    return {"enabled": _COLLECT_ENABLED, "at": state.get("at"), "kind": state.get("kind"),
+            "sources": state.get("sources") or {}, "errors": state.get("errors") or {}}
+
+
+# --- parsing (ported from hermes-metrics-dash forwarder.py) ---------------------------------
+
+_LOG_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),(\d{3})")
+_LOG_SESSION_RE = re.compile(r"^\S+ \S+ [A-Z]+ \[([^\]]+)\]")
+_GUARD_HALT_RE = re.compile(r"Turn ended: reason=guardrail_halt model=(\S+)"
+                            r" api_calls=(\d+)/\d+ .*?tool_turns=(\d+)")
+_GUARD_BLOCK_RE = re.compile(r"Tool (\S+) returned error .*?\"guardrail\":\s*\{\s*\"action\":\s*\"block\"")
+_GUARD_CODE_FULL_RE = re.compile(r"\"code\":\s*\"([A-Za-z0-9_]+)\"")
+_GUARD_CODE_PREFIX_RE = re.compile(r"\"code\":\s*\"([A-Za-z0-9_]+)")
+_GUARD_BLOCK_MSG_RE = re.compile(r"\{\"error\":\s*\"((?:[^\"\\]|\\.)*)\"")
+
+
+def _log_ts(line: str) -> Optional[float]:
+    m = _LOG_TS_RE.match(line)
+    if not m:
+        return None
+    try:
+        dt = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+        return dt.timestamp() + int(m.group(2)) / 1000.0
+    except ValueError:
+        return None
+
+
+def parse_agent_log_line(line: str) -> Optional[dict]:
+    """One agent.log line -> a guardrail_halt / guardrail_block record, or None.
+
+    Only guardrail events are extracted; message content stays out of the store.
+    """
+    halt = _GUARD_HALT_RE.search(line)
+    block = None if halt else _GUARD_BLOCK_RE.search(line)
+    if not halt and not block:
+        return None
+    ts = _log_ts(line)
+    if ts is None:
+        return None
+    sid_m = _LOG_SESSION_RE.match(line)
+    sid = sid_m.group(1) if sid_m else ""
+    if halt:
+        model, api_calls, tool_turns = halt.group(1), halt.group(2), halt.group(3)
+        return {"event": "guardrail_halt", "ts": ts, "session_id": sid, "model": model,
+                "finish_reason": "guardrail_halt",
+                "error_message": f"turn ended: reason=guardrail_halt after {api_calls} api calls"
+                                 f" / {tool_turns} tool turns"}
+    tool = block.group(1)
+    # hermes truncates long log lines, so the code may survive intact, as a prefix, or not at all.
+    code_m = _GUARD_CODE_FULL_RE.search(line)
+    if code_m:
+        code = code_m.group(1)
+    else:
+        code_m = _GUARD_CODE_PREFIX_RE.search(line)
+        code = code_m.group(1) + "…" if code_m else "block"
+    msg_m = _GUARD_BLOCK_MSG_RE.search(line)
+    msg = msg_m.group(1)[:160] if msg_m else ""
+    return {"event": "guardrail_block", "ts": ts, "session_id": sid, "label": tool,
+            "error_message": f"guardrail {code}: {msg}" if msg else f"guardrail {code}"}
+
+
+def _iso_ts(value) -> Optional[float]:
+    """Router/clientgate ts ("2026-08-02T10:03:42+0200") -> epoch; None when unparseable."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%dT%H:%M:%S%z").timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def _openai_usage(prompt_tokens, completion_tokens) -> Dict[str, Any]:
+    usage = {}
+    if isinstance(prompt_tokens, int):
+        usage["input_tokens"] = prompt_tokens
+    if isinstance(completion_tokens, int):
+        usage["output_tokens"] = completion_tokens
+    return usage
+
+
+def flatten_moa_turn(rec: dict) -> List[dict]:
+    """One moa-refs turn -> per-reference + aggregator metric records (message text dropped)."""
+    out = []
+    base = {"ts": rec.get("ts"), "session_id": rec.get("session_id"), "preset": rec.get("preset")}
+    for ref in rec.get("references") or []:
+        out.append({**base, "event": "moa_reference", "label": ref.get("label"), "model": ref.get("model"),
+                    "provider": ref.get("provider"), "duration_s": ref.get("duration_s"),
+                    "usage": ref.get("usage") or {}, "stats": ref.get("stats")})
+    agg = rec.get("aggregator") or {}
+    if agg.get("model"):
+        out.append({**base, "event": "moa_aggregator", "label": agg.get("label"),
+                    "model": agg.get("model"), "provider": agg.get("provider")})
+    return out
+
+
+def flatten_router_request(rec: dict) -> dict:
+    """One model-router exec-log line -> a router_request record (HTTP >= 400 becomes an error)."""
+    usage = rec.get("usage")
+    out = {"event": "router_request", "ts": _iso_ts(rec.get("ts")) or time.time(),
+           "label": rec.get("role") or None, "model": rec.get("model"),
+           "duration_s": rec.get("duration_s"),
+           "usage": _openai_usage(usage.get("prompt_tokens"), usage.get("completion_tokens"))
+           if isinstance(usage, dict) else {}}
+    status = rec.get("status")
+    if isinstance(status, int) and status >= 400:
+        reason = rec.get("reason") or ""
+        out["error_type"] = f"http_{status}"
+        out["error_message"] = (f"router returned {status} for role {rec.get('role') or '?'}"
+                                f" on {rec.get('path') or '?'}" + (f" ({reason})" if reason else ""))
+    return out
+
+
+def flatten_clientgate_request(rec: dict) -> dict:
+    """One clientgate usage-log line -> a clientgate_request record (HTTP >= 400 becomes an error)."""
+    out = {"event": "clientgate_request", "ts": _iso_ts(rec.get("ts")) or time.time(),
+           "label": rec.get("client") or None, "model": rec.get("model") or None,
+           "duration_ms": rec.get("duration_ms"),
+           "usage": _openai_usage(rec.get("prompt_tokens"), rec.get("completion_tokens"))}
+    status = rec.get("status")
+    if isinstance(status, int) and status >= 400:
+        out["error_type"] = f"http_{status}"
+        out["error_message"] = (f"clientgate returned {status} for client {rec.get('client') or '?'}"
+                                f" on {rec.get('path') or '?'}")
+    return out
+
+
+def normalize_record(rec: dict, host: str) -> dict:
+    """A raw source record -> the own store's `records` row (ported from metricsdash app.normalize).
+
+    Same kinds the fleet dashboard reads: api / error / moa_ref / moa_agg / subagent_stop /
+    host_stats / pool_status / gateway_status / guardrail_* / router_request / clientgate_request.
+    """
+    event = rec.get("event") or ""
+    usage = rec.get("usage") if isinstance(rec.get("usage"), dict) else {}
+    provider = rec.get("provider")
+    if event == "post_api_request":
+        kind = "moa_turn" if provider == "moa" else "api"
+    elif event == "api_request_error":
+        kind = "error"
+    elif event == "moa_reference":
+        kind = "moa_ref"
+    elif event == "moa_aggregator":
+        kind = "moa_agg"
+    elif event == "subagent_stop":
+        kind = "subagent_stop"
+    elif event == "host_stats":
+        kind = "host_stats"
+    elif event == "pool_status":
+        kind = "pool_status"
+    elif event == "gateway_status":
+        kind = "gateway_status"
+    elif event in ("router_request", "clientgate_request"):
+        kind = "error" if (rec.get("error_type") or rec.get("error_message")) else event
+    else:
+        kind = event or "unknown"
+
+    duration = rec.get("api_duration")
+    if duration is None:
+        duration = rec.get("duration_s")
+    if duration is None and rec.get("duration_ms") is not None:
+        try:
+            duration = float(rec["duration_ms"]) / 1000.0
+        except (TypeError, ValueError):
+            duration = None
+
+    tps = rec.get("tps")
+    out_tok = usage.get("output_tokens")
+    if tps is None and duration and out_tok:
+        try:
+            tps = round(float(out_tok) / float(duration), 2)
+        except (TypeError, ValueError, ZeroDivisionError):
+            tps = None
+
+    error = None
+    if rec.get("error_type") or rec.get("error_message"):
+        error = f"{rec.get('error_type') or ''}: {rec.get('error_message') or ''}".strip(": ")
+
+    stats = rec.get("stats") or usage.get("stats")
+    ttft_s = tps_native = spec_rate = None
+    if isinstance(stats, dict) and stats:
+        ttft_s = stats.get("time_to_first_token")
+        tps_native = stats.get("tokens_per_second")
+        spec_total = stats.get("total_draft_tokens_count")
+        spec_ok = stats.get("accepted_draft_tokens_count")
+        if spec_total and spec_ok is not None:
+            try:
+                spec_rate = round(float(spec_ok) / float(spec_total), 4)
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+
+    session_id = rec.get("session_id") or ""
+    parent_session_id = rec.get("parent_session_id")
+    if event == "subagent_stop" and rec.get("child_session_id"):
+        # Attribute the stop to the child; Hermes sends the spawning session as session_id.
+        parent_session_id = parent_session_id or session_id or None
+        session_id = rec["child_session_id"]
+
+    row = {
+        "ts": rec.get("ts") or time.time(), "host": rec.get("host") or host, "event": event, "kind": kind,
+        "session_id": session_id, "parent_session_id": parent_session_id,
+        "session_title": rec.get("session_title"), "turn_id": rec.get("turn_id"),
+        "api_request_id": rec.get("api_request_id"), "platform": rec.get("platform"),
+        "model": rec.get("model"), "provider": provider, "duration_s": duration, "tps": tps,
+        "input_tokens": usage.get("input_tokens"), "output_tokens": usage.get("output_tokens"),
+        "cache_read_tokens": usage.get("cache_read_tokens"), "cache_write_tokens": usage.get("cache_write_tokens"),
+        "reasoning_tokens": usage.get("reasoning_tokens"), "finish_reason": rec.get("finish_reason"),
+        "error": error, "preset": rec.get("preset"), "label": rec.get("label") or rec.get("child_role"),
+        "ttft_s": ttft_s, "tps_native": tps_native, "spec_accept_rate": spec_rate,
+        "device": rec.get("device"), "cost_usd": rec.get("session_cost_usd"),
+        "cpu_load": rec.get("cpu_load"), "mem_used_gb": rec.get("mem_used_gb"),
+        "mem_total_gb": rec.get("mem_total_gb"), "session_source": rec.get("session_source"),
+        "profile": rec.get("profile"), "session_started_at": rec.get("session_started_at"),
+        "assistant_content_chars": rec.get("assistant_content_chars"),
+        "response_model": rec.get("response_model"),
+    }
+    # The store is fed by an at-least-once tailer whose offsets only commit after a write, so an
+    # exact re-delivery must collapse instead of duplicating a row.
+    row["dedup_key"] = hashlib.sha1(
+        json.dumps({k: row[k] for k in STORE_RECORD_COLUMNS if k != "dedup_key"},
+                   sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    return row
+
+
+def _session_info(session_id: str, cache: Dict[str, dict]) -> Dict[str, Any]:
+    """Best-effort title/parent/cost from state.db, read-only; missing DB = no enrichment."""
+    if not session_id:
+        return {}
+    info = dict(cache.get(session_id) or {})
+    try:
+        uri = f"file:{_SESSION_DB}?mode=ro"
+        with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=1.5)) as conn:
+            if not info:
+                row = conn.execute("SELECT title, parent_session_id, source, started_at FROM sessions"
+                                   " WHERE id = ?", (session_id,)).fetchone()
+                if row:
+                    info = {"session_title": row[0], "parent_session_id": row[1],
+                            "session_source": row[2], "session_started_at": row[3]}
+                    cache[session_id] = dict(info)
+            crow = conn.execute("SELECT estimated_cost_usd FROM sessions WHERE id = ?",
+                                (session_id,)).fetchone()
+            if crow and crow[0] is not None:
+                info["session_cost_usd"] = crow[0]
+    except Exception:
+        pass  # an older or absent state.db: the records are simply not enriched
+    return info
+
+
+_PAGE_SIZE_RE = re.compile(r"page size of (\d+)")
+_VM_PAGE_RE = re.compile(r"(Pages [a-z ]+?|Anonymous pages|File-backed pages):\s+(\d+)\.")
+
+
+def sample_host_stats(now: Optional[float] = None) -> dict:
+    """CPU load + memory for this machine (macOS/Windows, stdlib only; never raises)."""
+    rec = {"event": "host_stats", "ts": time.time() if now is None else now}
+    try:
+        rec["cpu_load"] = round(os.getloadavg()[0], 2)
+    except (OSError, AttributeError):
+        try:
+            out = subprocess.check_output(
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage"
+                 " -Average).Average"], timeout=8).decode().strip()
+            rec["cpu_load"] = round((float(out) / 100.0) * (os.cpu_count() or 1), 2)
+        except Exception:
+            pass
+    try:
+        total = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], timeout=5))
+        vm = subprocess.check_output(["vm_stat"], timeout=5).decode()
+        m = _PAGE_SIZE_RE.search(vm)
+        page = int(m.group(1)) if m else 16384
+        pages = {}
+        for line in vm.splitlines():
+            mm = _VM_PAGE_RE.match(line.strip())
+            if mm:
+                pages[mm.group(1)] = int(mm.group(2))
+        used = (pages.get("Pages active", 0) + pages.get("Pages wired down", 0)
+                + pages.get("Pages occupied by compressor", 0)) * page
+        rec["mem_used_gb"] = round(used / 2 ** 30, 2)
+        rec["mem_total_gb"] = round(total / 2 ** 30, 2)
+    except Exception:
+        try:
+            out = subprocess.check_output(
+                ["powershell", "-NoProfile", "-Command",
+                 "$o=Get-CimInstance Win32_OperatingSystem;"
+                 "[math]::Round(($o.TotalVisibleMemorySize-$o.FreePhysicalMemory)/1MB,2);"
+                 "[math]::Round($o.TotalVisibleMemorySize/1MB,2)"], timeout=8).decode().strip().splitlines()
+            if len(out) >= 2:
+                rec["mem_used_gb"], rec["mem_total_gb"] = float(out[0]), float(out[1])
+        except Exception:
+            pass
+    return rec
+
+
+def pool_snapshot(now: float) -> List[dict]:
+    """Loaded LM Studio models and the device serving each (`lms ps --json`; [] when absent)."""
+    try:
+        loaded = json.loads(subprocess.check_output([_LMS_BIN, "ps", "--json"], timeout=10,
+                                                    stderr=subprocess.DEVNULL))
+    except Exception:
+        return []
+    names, local = {}, HOST_LABEL
+    try:
+        link = json.loads(subprocess.check_output([_LMS_BIN, "link", "status", "--json"], timeout=10,
+                                                  stderr=subprocess.DEVNULL))
+        for p in link.get("peers") or []:
+            if p.get("deviceIdentifier"):
+                names[p["deviceIdentifier"]] = p.get("deviceName") or p["deviceIdentifier"]
+        local = link.get("deviceName") or local
+    except Exception:
+        pass  # keep raw ids rather than losing the snapshot
+    rows = []
+    for e in loaded if isinstance(loaded, list) else []:
+        model = (e or {}).get("identifier")
+        if not model:
+            continue
+        dev = e.get("deviceIdentifier")
+        rows.append({"event": "pool_status", "ts": now, "model": model,
+                     "device": names.get(dev, dev) if dev else local})
+    return rows
+
+
+GATEWAY_RESEND_S = 3600
+
+
+def gateway_changes(state: Dict[str, Any], now: float) -> List[dict]:
+    """Chat-bot connection changes -> gateway_status records (running gateways only)."""
+    last = state.setdefault("gateway", {})
+    current: Dict[str, Any] = {}
+    for f in [_METRICS_ROOT / "gateway_state.json",
+              *sorted(_METRICS_ROOT.glob("profiles/*/gateway_state.json"))]:
+        try:
+            st = json.loads(f.read_text(encoding="utf-8"))
+            pid = int(st.get("pid") or 0)
+            if st.get("gateway_state") != "running" or pid <= 0:
+                continue
+            os.kill(pid, 0)
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+        owner = "default" if f.parent == _METRICS_ROOT else f.parent.name
+        for key, p in (st.get("platforms") or {}).items():
+            if not isinstance(p, dict):
+                continue
+            profile, _, name = key.rpartition(":")
+            cur = "stale" if p.get("writer_pid") not in (None, pid) else p.get("state") or "unknown"
+            error = (p.get("error_message") or "").split("\n")[0][:200] or None
+            current[f"{profile or owner}:{name}"] = [cur, error]
+    for key in last:
+        if key not in current and (last[key] or ["", ""])[0] != "stopped":
+            current[key] = ["stopped", None]
+    rows = []
+    for key, (cur, error) in current.items():
+        prev = last.get(key)
+        if prev and prev[:2] == [cur, error] and now - (prev[2] if len(prev) > 2 else 0) < GATEWAY_RESEND_S:
+            continue
+        last[key] = [cur, error, now]
+        rows.append({"event": "gateway_status", "ts": now, "platform": key, "label": cur,
+                     "error_message": error})
+    return rows
+
+
+# --- host probes: conformance results and health findings -----------------------------------
+
+_SECRET_RE = re.compile(r"glpat-[\w-]+|gh[pousr]_\w+|sk-[\w-]{8,}|Bearer\s+\S+")
+_KEY_RE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=")
+_EVIDENCE_LINES, _EVIDENCE_CHARS = 5, 200
+
+
+def _local_standard() -> Optional[Path]:
+    """The conformance standard this host can check itself against: a LOCAL file only.
+
+    A GitLab-hosted standard is checked by each host's own forwarder, so the collector does not
+    reach the network for it.
+    """
+    project = (_settings().get("conformance_project") or "").strip()
+    local = _local_file(project) if project else None
+    if local and local.is_file():
+        return local
+    return _LOCAL_STANDARD if _LOCAL_STANDARD.is_file() else None
+
+
+def _redacted(lines: List[Any]) -> List[str]:
+    return [_SECRET_RE.sub("[redacted]", str(x))[:_EVIDENCE_CHARS] for x in lines[:_EVIDENCE_LINES]]
+
+
+def _run(cmd: List[str], timeout: int = 10) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def check_revision(check: dict, repo: Path, now: float) -> tuple:
+    stamp_path = Path(os.path.expanduser(check["stamp"]))
+    if not stamp_path.exists():
+        return False, "no install stamp", [f"{check['stamp']} not found: no installer has run since stamps began"]
+    installers = json.loads(stamp_path.read_text(encoding="utf-8")).get("installers") or {}
+    if not installers:
+        return False, "empty install stamp", []
+    upstream = ("origin/main" if _run(["git", "-C", str(repo), "rev-parse", "-q", "--verify",
+                                       "origin/main"]).returncode == 0 else "main")
+    worst_behind, oldest_days, unknown, evidence = 0, 0.0, False, []
+    for name, entry in sorted(installers.items()):
+        commit = entry.get("commit") or "unknown"
+        try:
+            days = (now - datetime.fromisoformat(entry["at"]).timestamp()) / 86400
+        except (KeyError, ValueError, TypeError):
+            days = 0.0
+        oldest_days = max(oldest_days, days)
+        r = _run(["git", "-C", str(repo), "rev-list", "--count", f"{commit}..{upstream}"])
+        if r.returncode != 0:
+            unknown = True
+            evidence.append(f"{name}: commit {commit} is not in this checkout")
+            continue
+        behind = int(r.stdout.strip())
+        worst_behind = max(worst_behind, behind)
+        if behind > check.get("max_behind_commits", 0) or days > check.get("max_age_days", 0):
+            evidence.append(f"{name}: {commit}, {behind} behind {upstream}, {days:.0f} days old")
+        if entry.get("dirty"):
+            evidence.append(f"{name}: installed from a checkout with uncommitted changes")
+    ok = (not unknown and worst_behind <= check.get("max_behind_commits", 0)
+          and oldest_days <= check.get("max_age_days", 0))
+    return ok, ("unknown commits" if unknown else f"{worst_behind} commits") + f" behind, oldest {oldest_days:.0f} days", evidence
+
+
+def check_jobs(std: dict, host: dict) -> tuple:
+    roles = std.get("roles") or {}
+    labels = []
+    for role in host.get("roles") or []:
+        for label in ((roles.get(role) or {}).get("jobs") or {}).get(host.get("os"), []):
+            if label not in labels:
+                labels.append(label)
+    missing = []
+    for label in labels:
+        if host.get("os") == "windows":
+            r = _run(["schtasks", "/query", "/tn", label])
+        else:
+            r = _run(["launchctl", "print", f"gui/{os.getuid()}/{label}"])
+        if r.returncode != 0:
+            missing.append(f"{label}: {(r.stderr or r.stdout or '').strip().splitlines()[:1] or ['not loaded']}")
+    return not missing, f"{len(labels) - len(missing)} of {len(labels)}", missing
+
+
+def check_port(check: dict) -> tuple:
+    url = check["url"]
+    if urllib.parse.urlparse(url).hostname not in ("127.0.0.1", "localhost", "::1"):
+        return False, "not loopback", [f"{url}: port checks only probe loopback"]
+    try:
+        with urllib.request.urlopen(url, timeout=check.get("timeout_s", 2)) as resp:
+            return 200 <= resp.status < 300, str(resp.status), []
+    except urllib.error.HTTPError as exc:
+        return False, str(exc.code), [f"{url}: HTTP {exc.code}"]
+    except (urllib.error.URLError, OSError) as exc:
+        return False, "no answer", [f"{url}: {getattr(exc, 'reason', exc)}"]
+
+
+def check_keys(check: dict, repo: Path) -> tuple:
+    def names(path: Path) -> List[str]:
+        out = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            m = _KEY_RE.match(line.strip())
+            if m:
+                out.append(m.group(1))
+        return out
+    have_path, want_path = repo / check["file"], repo / check["against"]
+    if not have_path.exists():
+        return False, f"{check['file']} missing", [f"{have_path} not found"]
+    want = names(want_path)
+    have = set(names(have_path))
+    missing = [k for k in want if k not in have]
+    return not missing, f"{len(want) - len(missing)} of {len(want)}", [f"missing key: {k}" for k in missing]
+
+
+def conformance_record(label: str, standard_path: Path, now: float) -> Optional[dict]:
+    """This host's conformance_result against a local standard, or None when it cannot be read."""
+    std = safe_load(standard_path.read_text(encoding="utf-8"))
+    if not isinstance(std, dict):
+        return None
+    repo = standard_path.parent
+    rev = _run(["git", "-C", str(repo), "rev-parse", "--short", "HEAD"])
+    rec = {"event": "conformance_result", "ts": now,
+           "standard": {"name": std.get("standard"), "rev": rev.stdout.strip() if rev.returncode == 0 else "unknown"},
+           "results": []}
+    host = (std.get("hosts") or {}).get(label)
+    if host is None:
+        rec["results"].append({"rule": "unclassified", "status": "warn", "value": "not in hosts:",
+                               "evidence": [f"{label} is not declared in {standard_path.name}"]})
+        return rec
+    tags = set(host.get("roles") or []) | {host.get("os")}
+    for rule in std.get("host_rules") or []:
+        check = rule.get("check") or {}
+        if not tags & set(rule.get("applies_to") or []):
+            rec["results"].append({"rule": rule["id"], "status": "na", "value": "", "evidence": []})
+            continue
+        try:
+            kind = check.get("kind")
+            if kind == "revision":
+                ok, value, evidence = check_revision(check, repo, now)
+            elif kind == "job":
+                ok, value, evidence = check_jobs(std, host)
+            elif kind == "port":
+                ok, value, evidence = check_port(check)
+            elif kind == "keys":
+                ok, value, evidence = check_keys(check, repo)
+            else:
+                ok, value, evidence = False, f"unsupported kind {kind}", ["this plugin cannot run this check"]
+        except Exception as exc:  # one broken check must not stop the others
+            ok, value, evidence = False, "check error", [f"{type(exc).__name__}: {exc}"]
+        status = "pass" if ok else ("fail" if rule.get("severity") == "blocks" else "warn")
+        rec["results"].append({"rule": rule["id"], "status": status,
+                               "value": str(value)[:_EVIDENCE_CHARS], "evidence": _redacted(evidence)})
+    return rec
+
+
+_CONFORMANCE_STATUSES = ("pass", "warn", "fail", "na")
+
+
+def conformance_rows(rec: dict, label: str, verified: bool) -> List[dict]:
+    """conformance_results rows from one report; malformed results are dropped."""
+    std = rec.get("standard") if isinstance(rec.get("standard"), dict) else {}
+    ts = rec.get("ts") if isinstance(rec.get("ts"), (int, float)) else time.time()
+    rows = []
+    for r in rec.get("results") or []:
+        if not isinstance(r, dict) or r.get("status") not in _CONFORMANCE_STATUSES:
+            continue
+        rule = r.get("rule")
+        if not isinstance(rule, str) or not rule or len(rule) > 100:
+            continue
+        evidence = r.get("evidence") if isinstance(r.get("evidence"), list) else []
+        rows.append({"ts": ts, "host": label, "rule": rule, "standard": str(std.get("name") or "")[:100],
+                     "standard_rev": str(std.get("rev") or "")[:40], "status": r["status"],
+                     "value": str(r.get("value") or "")[:_EVIDENCE_CHARS],
+                     "evidence": json.dumps(_redacted(evidence)), "verified": 1 if verified else 0})
+    return rows
+
+
+def health_findings(now: float, source_states: Dict[str, Any], store_error: str = "") -> List[dict]:
+    """This host's own health rules, one row per rule each pass (sev "ok" when it is fine).
+
+    Only the states this plugin can actually see: its store being written, its collector sources,
+    and the alert heartbeat. Nothing is guessed about other hosts.
+    """
+    rows: List[dict] = []
+
+    def add(rule: str, sev: str, text: str, action: str = "") -> None:
+        rows.append({"ts": now, "window_hours": 1.0, "rule": rule, "sev": sev, "text": text,
+                     "action": action or None})
+
+    if store_error:
+        add("OPS1", "crit", f"Operations' own metrics store is not being written ({store_error})",
+            "fix ~/.hermes/metrics/operations.db permissions or remove the file")
+    else:
+        add("OPS1", "ok", "Operations' own metrics store is being written")
+    failing = [(name, s) for name, s in source_states.items()
+               if int(s.get("fails") or 0) >= SOURCE_FAILS_TO_REPORT]
+    if failing:
+        for name, s in sorted(failing):
+            add(f"OPS2-{name}"[:32], "warn",
+                f"collector source {name} has failed {s['fails']} times in a row: {s.get('last_error') or ''}",
+                "check the file it tails and its permissions")
+    else:
+        add("OPS2", "ok", "every collector source is reading")
+    hb = heartbeat_state(now)
+    if hb["mode"] == "none":
+        add("OPS3", "warn", "no alert heartbeat: neither a dispatcher tick nor this plugin's own"
+            " timer has swept recently", "check the hermes gateway and its kanban dispatcher")
+    else:
+        add("OPS3", "ok", f"alert heartbeat is running ({hb['mode']})")
+    return rows
+
+
+def _prune(conn: sqlite3.Connection, days: int, now: float) -> Dict[str, int]:
+    """Drop what the retention setting no longer keeps. 0 = forever (nothing is pruned)."""
+    pruned = {"records": 0, "health_findings": 0}
+    if days:
+        cutoff = now - days * 86400
+        for table in ("records", "health_findings"):
+            cur = conn.execute(f"DELETE FROM {table} WHERE ts < ?", (cutoff,))
+            pruned[table] = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+    conf_cutoff = now - CONFORMANCE_KEEP_DAYS * 86400
+    cur = conn.execute("DELETE FROM conformance_results WHERE ts < ?", (conf_cutoff,))
+    pruned["conformance_results"] = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+    conn.commit()
+    return pruned
+
+
+# --- the pass -------------------------------------------------------------------------------
+
+def _insert_rows(conn: sqlite3.Connection, rows: List[dict]) -> int:
+    """Insert normalized rows, collapsing exact re-deliveries on dedup_key. Returns rows added."""
+    inserted = 0
+    for row in rows:
+        keys = [k for k in STORE_RECORD_COLUMNS if k in row]
+        sql = (f"INSERT OR IGNORE INTO records ({', '.join(keys)})"
+               f" VALUES ({', '.join('?' * len(keys))})")
+        cur = conn.execute(sql, tuple(row[k] for k in keys))
+        inserted += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+    conn.commit()
+    return inserted
+
+
+def _insert_conformance(conn: sqlite3.Connection, rows: List[dict]) -> int:
+    n = 0
+    for row in rows:
+        cur = conn.execute(
+            "INSERT INTO conformance_results (ts, host, rule, standard, standard_rev, status, value,"
+            " evidence, verified) VALUES (?,?,?,?,?,?,?,?,?)",
+            (row["ts"], row["host"], row["rule"], row["standard"], row["standard_rev"], row["status"],
+             row["value"], row["evidence"], row["verified"]))
+        n += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+    conn.commit()
+    return n
+
+
+def _insert_findings(conn: sqlite3.Connection, rows: List[dict]) -> int:
+    for row in rows:
+        conn.execute("INSERT INTO health_findings (ts, window_hours, rule, sev, text, action, beta)"
+                     " VALUES (?,?,?,?,?,?,?)",
+                     (row["ts"], row["window_hours"], row["rule"], row["sev"], row["text"],
+                      row["action"], 0))
+    conn.commit()
+    return len(rows)
+
+
+def collect_once(kind: str = "tick", now: Optional[float] = None) -> Dict[str, Any]:
+    """One incremental collection pass. Never raises; returns what it did, and what failed.
+
+    ``kind="route"`` is the cheap read-path pass (tail + prune). ``kind="tick"`` adds the periodic
+    host/pool/gateway samples and the host probes, which is what a dispatcher tick and the own
+    heartbeat timer run. Offsets are written only after the store commits, so a restart re-reads
+    and the dedup key collapses the overlap: neither dropped nor duplicated.
+    """
+    at = time.time() if now is None else now
+    out: Dict[str, Any] = {"enabled": _COLLECT_ENABLED, "kind": kind, "at": at, "records": 0,
+                           "pruned": {}, "errors": {}, "sources": {}}
+    if not _COLLECT_ENABLED:
+        return out
+    state = _load_collect_state()
+    sessions: Dict[str, dict] = {}
+    rows: List[dict] = []
+    conn: Optional[sqlite3.Connection] = None
+
+    def tail(name: str, fn) -> None:
+        entry = (state.get("sources") or {}).get(name) or {}
+        if int(entry.get("fails") or 0) >= SOURCE_FAILS_TO_REPORT and (entry.get("backoff_until") or 0) > at:
+            # Backing off a source that keeps failing: retried at most every SOURCE_BACKOFF_S,
+            # and the reason is carried so the state is never a silent one.
+            out["errors"][name] = (f"backing off until {int(entry['backoff_until'])}:"
+                                   f" {entry.get('last_error') or ''}").strip()
+            return
+        try:
+            got = fn()
+        except Exception as exc:
+            out["errors"][name] = f"{type(exc).__name__}: {exc}"
+            entry = _source_health(state, name, False, out["errors"][name], now=at)
+            if int(entry.get("fails") or 0) < SOURCE_FAILS_TO_REPORT:
+                out["errors"].pop(name, None)  # a single hiccup is retried, not reported as failure
+            return
+        rows.extend(got)
+        _source_health(state, name, True, now=at)
+
+    try:
+        tail("requests", lambda: [dict(r, **_session_info(r.get("session_id") or "", sessions))
+                                  for r in _read_new_lines(_REQUESTS_JSONL, state)])
+        tail("moa-refs", lambda: [dict(x, **_session_info(x.get("session_id") or "", sessions))
+                                  for t in _read_new_lines(_MOA_REFS_JSONL, state)
+                                  for x in flatten_moa_turn(t)])
+        def guardrails() -> List[dict]:
+            got = []
+            for line in _read_new_text_lines(_AGENT_LOG, state):
+                rec = parse_agent_log_line(line)
+                if rec:
+                    rec.update(_session_info(rec.get("session_id") or "", sessions))
+                    got.append(rec)
+            return got
+        tail("agent-log", guardrails)
+        tail("router", lambda: [flatten_router_request(r) for r in _read_new_lines(_ROUTER_JSONL, state, seed_eof=True)])
+        tail("clientgate", lambda: [flatten_clientgate_request(r)
+                                    for r in _read_new_lines(_CLIENTGATE_JSONL, state, seed_eof=True)])
+
+        if kind == "tick":
+            rows.append(sample_host_stats(at))
+            rows.extend(pool_snapshot(at))
+            rows.extend(gateway_changes(state, at))
+        _source_health(state, "host-probes", True, now=at)
+
+        store_path = operations_db()
+        if not rows and not store_path.exists():
+            # Nothing collected yet and nothing to write: reading must not create an empty store
+            # (the fleet metrics.db stays the fallback until there is data of our own).
+            pass
+        else:
+            try:
+                conn = ensure_store()
+            except Exception as exc:
+                out["errors"]["store"] = f"{type(exc).__name__}: {exc}"
+                _source_health(state, "store", False, out["errors"]["store"], now=at)
+                conn = None
+            if conn is not None:
+                normalized = [normalize_record(r, HOST_LABEL) for r in rows]
+                out["records"] = _insert_rows(conn, normalized)
+
+                if kind == "tick":
+                    standard = _local_standard()
+                    last_conf = (state.get("probes") or {}).get("conformance_at") or 0
+                    if standard and at - last_conf >= _CONFORMANCE_INTERVAL_S:
+                        try:
+                            rec = conformance_record(HOST_LABEL, standard, at)
+                            if rec:
+                                _insert_conformance(conn, conformance_rows(rec, HOST_LABEL, verified=True))
+                                state.setdefault("probes", {})["conformance_at"] = at
+                                _source_health(state, "conformance-probe", True, now=at)
+                            else:
+                                _source_health(state, "conformance-probe", False, "standard is not a mapping", now=at)
+                        except Exception as exc:
+                            out["errors"]["conformance"] = f"{type(exc).__name__}: {exc}"
+                            _source_health(state, "conformance-probe", False, out["errors"]["conformance"], now=at)
+                    _insert_findings(conn, health_findings(at, state.get("sources") or {},
+                                                           out["errors"].get("store", "")))
+
+                out["pruned"] = _prune(conn, retention_days(), at)
+    except Exception as exc:
+        out["errors"]["collector"] = f"{type(exc).__name__}: {exc}"
+        _source_health(state, "collector", False, out["errors"]["collector"], now=at)
+    finally:
+        if conn is not None:
+            conn.close()
+
+    # Offsets commit here, after the store committed: a crash before this re-reads and dedupes.
+    state["at"], state["kind"] = at, kind
+    state["errors"] = out["errors"]
+    state["sources"] = state.get("sources") or {}
+    out["sources"] = state["sources"]
+    try:
+        _save_collect_state(state)
+    except Exception as exc:
+        out["errors"]["state"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
+# --- retention + the storage report --------------------------------------------------------
+
+def retention_days() -> int:
+    """The metrics_retention_days setting, validated: 30 (default) / 60 / 90 / 0 = forever."""
+    value = _settings().get(RETENTION_SETTING)
+    try:
+        days = int(value)
+    except (TypeError, ValueError):
+        return RETENTION_DEFAULT
+    return days if days in RETENTION_OPTIONS else RETENTION_DEFAULT
+
+
+def table_sizes(path: Path) -> Dict[str, int]:
+    """Bytes per own-store table.
+
+    sqlite's dbstat virtual table when the engine has it; otherwise each table's share of the
+    file by row count (an estimate, and said so in the payload flag).
+    """
+    out: Dict[str, int] = {}
+    try:
+        conn = _ro(path)
+    except sqlite3.Error:
+        return out
+    try:
+        have = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        try:
+            for name, size in conn.execute("SELECT name, SUM(pgsize) FROM dbstat GROUP BY name"):
+                if name in have and not name.startswith("sqlite_"):
+                    out[str(name)] = int(size or 0)
+            if out:
+                out["_estimated"] = 0  # type: ignore[assignment]
+                return out
+        except sqlite3.Error:
+            pass
+        total = conn.execute("PRAGMA page_count").fetchone()[0] * conn.execute("PRAGMA page_size").fetchone()[0]
+        counts = {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in _STORE_TABLES if t in have}
+        whole = sum(counts.values()) or 1
+        out = {t: int(total * c / whole) for t, c in counts.items()}
+        out["_estimated"] = 1  # type: ignore[assignment]
+    except sqlite3.Error:
+        return {}
+    finally:
+        conn.close()
+    return out
+
+
+def _mb(n: int) -> float:
+    return round(n / (1024 * 1024), 1)
+
+
+def storage_report(now: Optional[float] = None) -> Dict[str, Any]:
+    """The own store's size, per table, and what each retention option projects to.
+
+    The projection is the design's measured mean: records grow ~1.6 MB/day, tabular tables hold
+    what they hold. An option is what the collector would keep if it were chosen now.
+    """
+    now = time.time() if now is None else now
+    own = operations_db()
+    days = retention_days()
+    errors: Dict[str, str] = {}
+    sizes = table_sizes(own)
+    estimated = bool(sizes.pop("_estimated", 0))
+    logical = sum(sizes.values())
+    try:
+        file_bytes = own.stat().st_size
+    except OSError:
+        file_bytes = 0
+    counts = _table_counts(own)
+    records_bytes = sizes.get("records", 0)
+    other_bytes = max(0, logical - records_bytes)
+    other_mb = _mb(other_bytes)
+    current_records_mb = _mb(records_bytes)
+    projections = []
+    for option in RETENTION_OPTIONS:
+        if option:
+            mb = round(option * MB_PER_DAY + other_mb, 1)
+            projections.append({"days": option, "label": f"{option} days", "projected_mb": mb})
+        else:
+            # forever: what it is now, plus a month at the measured rate
+            mb = round(max(current_records_mb, MB_PER_DAY) + other_mb + MB_PER_DAY * 30, 1)
+            projections.append({"days": 0, "label": "forever",
+                                "projected_mb": round(max(current_records_mb, MB_PER_DAY) + other_mb, 1),
+                                "monthly_mb": round(MB_PER_DAY * 30, 1)})
+    return {
+        "generated_at": now,
+        "store": str(own),
+        "exists": own.exists(),
+        "bytes": logical,
+        "file_bytes": file_bytes,
+        "mb": _mb(logical),
+        "estimated": estimated,
+        "tables": [{"table": t, "mb": _mb(sizes.get(t, 0)), "rows": counts.get(t, 0)}
+                   for t in _STORE_TABLES],
+        "retention_days": days,
+        "options": [{"days": d, "label": "forever" if not d else f"{d} days"} for d in RETENTION_OPTIONS],
+        "mb_per_day": MB_PER_DAY,
+        "projections": projections,
+        "metrics_source": metrics_source()[1],
+        "metrics_dash": metrics_dash_probe(),
+        "heartbeat": heartbeat_state(now),
+        "collector": source_state(),
+        "errors": errors,
+    }
+
+
+# --- recognition: is the metrics dashboard here? -------------------------------------------
+
+_DASH_PROBE: Dict[str, Any] = {"at": 0.0, "value": None, "fails": 0, "since": None,
+                               "last_error": None, "recovered_at": None}
+_DASH_CAPABILITY_KEYS = ("db_bytes", "records", "oldest_ts", "retention_days", "heartbeat_hours", "capabilities")
+
+
+def _dash_payload() -> Dict[str, Any]:
+    v = _DASH_PROBE["value"]
+    present = v is not None
+    caps = {k: v[k] for k in _DASH_CAPABILITY_KEYS if k in (v or {})}
+    return {"url": _METRICS_DASH_URL, "present": present, "link": _METRICS_DASH_URL + "/" if present else None,
+            "revision": (v or {}).get("revision") or None, "capabilities": caps,
+            "checked_at": _DASH_PROBE["at"] or None, "fails": int(_DASH_PROBE["fails"] or 0),
+            "since": _DASH_PROBE["since"], "last_error": _DASH_PROBE["last_error"],
+            "recovered_at": _DASH_PROBE["recovered_at"]}
+
+
+def metrics_dash_probe(force: bool = False) -> Dict[str, Any]:
+    """Does the metrics dashboard answer on METRICS_DASH_URL (default 127.0.0.1:8899)?
+
+    Cached for DASH_PROBE_TTL_S, and honest when it fails: consecutive failures, the last error,
+    and when the run began. Recognition only — this never switches the writer, so the two never
+    write the same store.
+    """
+    now = time.time()
+    if not force and _DASH_PROBE["value"] is not None and now - (_DASH_PROBE["at"] or 0) < DASH_PROBE_TTL_S:
+        return _dash_payload()
+    _DASH_PROBE["at"] = now
+    failed = _DASH_PROBE["value"] is None and int(_DASH_PROBE["fails"] or 0) > 0
+    try:
+        with urllib.request.urlopen(_METRICS_DASH_URL + "/api/about", timeout=1.0) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("not an object")
+        _DASH_PROBE.update(value=data, fails=0, since=None, last_error=None,
+                           recovered_at=now if failed else None)
+    except Exception as exc:
+        _DASH_PROBE.update(value=None, fails=int(_DASH_PROBE["fails"] or 0) + 1,
+                           since=_DASH_PROBE["since"] or now,
+                           last_error=f"{type(exc).__name__}: {exc}")
+    return _dash_payload()
+
+
+def heartbeat_state(now: Optional[float] = None) -> Dict[str, Any]:
+    """Whether the alert sweep rode the dispatcher tick or this plugin's own timer.
+
+    ../__init__.py writes the file. "own-timer" is the fallback: no tick within two dispatcher
+    intervals. "none" means nothing has swept — the page must be able to say that too.
+    """
+    now = time.time() if now is None else now
+    try:
+        data = json.loads(_HEARTBEAT.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    tick = data.get("last_tick")
+    sweep = data.get("last_sweep")
+    by = data.get("by")
+    try:
+        stale = tick is None or (now - float(tick)) > 2 * TICK_INTERVAL_S
+    except (TypeError, ValueError):
+        tick = None  # a corrupt heartbeat reads as "nothing has swept", not as an exception
+        stale = True
+    if by == "own-timer" or (stale and sweep is not None):
+        mode = "own-timer"
+    elif tick is not None and not stale:
+        mode = "tick"
+    else:
+        mode = "none"
+    return {"mode": mode, "by": by, "last_tick": tick, "last_sweep": sweep, "stale": bool(stale),
+            "interval_s": TICK_INTERVAL_S, "error": data.get("error") or None}
 
 
 def _local_midnight(now: float) -> float:
@@ -450,7 +1745,8 @@ def overview(hours: int = Query(24, ge=1, le=168)) -> Dict[str, Any]:
     now = time.time()
     since = now - hours * 3600
     out: Dict[str, Any] = {"generated_at": now, "hours": hours, "errors": {}}
-    m = _ro_or_empty(_METRICS_DB, _EMPTY_METRICS, out["errors"], "metrics")
+    m, out["metrics_source"] = _metrics_conn(out["errors"])
+    out["heartbeat"] = heartbeat_state(now)
     k = _ro_or_empty(_KANBAN_DB, _EMPTY_KANBAN, out["errors"], "kanban")
     sections = {
         "vitals": lambda: vitals(m, k, since, now),
@@ -476,7 +1772,8 @@ def overview(hours: int = Query(24, ge=1, le=168)) -> Dict[str, Any]:
 def attention_route() -> Dict[str, Any]:
     """Just the attention list, for Desktop's background alert poll."""
     out: Dict[str, Any] = {"items": [], "errors": {}}
-    m = _ro_or_empty(_METRICS_DB, _EMPTY_METRICS, out["errors"], "metrics")
+    m, out["metrics_source"] = _metrics_conn(out["errors"])
+    out["heartbeat"] = heartbeat_state()
     k = _ro_or_empty(_KANBAN_DB, _EMPTY_KANBAN, out["errors"], "kanban")
     try:
         out["items"] = attention(m, k, time.time())
@@ -814,7 +2111,7 @@ def changes(hours: int = Query(24, ge=1, le=168)) -> Dict[str, Any]:
         items += merged
     except (RuntimeError, urllib.error.URLError, OSError, ValueError, KeyError) as exc:
         errors["gitlab"] = str(exc)
-    m = _ro_or_empty(_METRICS_DB, _EMPTY_METRICS, errors, "models")
+    m, metrics_src = _metrics_conn(errors, "models")
     try:
         items += model_changes(m, since)
     except sqlite3.Error as exc:
@@ -823,7 +2120,8 @@ def changes(hours: int = Query(24, ge=1, le=168)) -> Dict[str, Any]:
         m.close()
     items.sort(key=lambda i: -i["ts"])
     return {"generated_at": now, "hours": hours, "items": items[:CHANGES_LIMIT],
-            "truncated": truncated or len(items) > CHANGES_LIMIT, "errors": errors}
+            "truncated": truncated or len(items) > CHANGES_LIMIT, "metrics_source": metrics_src,
+            "errors": errors}
 
 
 
@@ -1012,7 +2310,7 @@ def _window(hours: int, start: Optional[float]) -> tuple:
 def flow(hours: int = Query(24, ge=1, le=168), start: Optional[float] = None) -> Dict[str, Any]:
     since, until = _window(hours, start)
     out: Dict[str, Any] = {"generated_at": time.time(), "hours": hours, "start": start, "errors": {}}
-    m = _ro_or_empty(_METRICS_DB, _EMPTY_METRICS, out["errors"], "metrics")
+    m, out["metrics_source"] = _metrics_conn(out["errors"])
     try:
         out.update(request_flow(m, since, until))
     except sqlite3.Error as exc:
@@ -1265,7 +2563,7 @@ def error_groups(m: sqlite3.Connection, since: float, until: float) -> List[Dict
 def errors_route(hours: int = Query(1, ge=1, le=168), start: Optional[float] = None) -> Dict[str, Any]:
     since, until = _window(hours, start)
     out: Dict[str, Any] = {"generated_at": time.time(), "hours": hours, "start": start, "groups": [], "errors": {}}
-    m = _ro_or_empty(_METRICS_DB, _EMPTY_METRICS, out["errors"], "metrics")
+    m, out["metrics_source"] = _metrics_conn(out["errors"])
     try:
         out["groups"] = error_groups(m, since, until)
     except sqlite3.Error as exc:
@@ -1472,7 +2770,7 @@ def _failures(m: sqlite3.Connection, sid: str, calls: List[Dict[str, Any]]) -> L
 def trace(hours: int = Query(24, ge=1, le=168), start: Optional[float] = None) -> Dict[str, Any]:
     since, until = _window(hours, start)
     out: Dict[str, Any] = {"generated_at": time.time(), "hours": hours, "start": start, "errors": {}}
-    m = _ro_or_empty(_METRICS_DB, _EMPTY_METRICS, out["errors"], "metrics")
+    m, out["metrics_source"] = _metrics_conn(out["errors"])
     try:
         out.update(sessions(m, since, until))
     except sqlite3.Error as exc:
@@ -1485,7 +2783,7 @@ def trace(hours: int = Query(24, ge=1, le=168), start: Optional[float] = None) -
 @router.get("/trace/{session_id}")
 def trace_session(session_id: str) -> Dict[str, Any]:
     out: Dict[str, Any] = {"errors": {}}
-    m = _ro_or_empty(_METRICS_DB, _EMPTY_METRICS, out["errors"], "metrics")
+    m, out["metrics_source"] = _metrics_conn(out["errors"])
     try:
         out.update(session_trace(m, session_id))
     except sqlite3.Error as exc:
@@ -1564,7 +2862,7 @@ def find_session(m: sqlite3.Connection, prefix: str, before: float) -> Optional[
 @router.get("/find-session")
 def find_session_route(prefix: str = Query(..., min_length=8), before: float = Query(...)) -> Dict[str, Any]:
     out: Dict[str, Any] = {"session": None, "errors": {}}
-    m = _ro_or_empty(_METRICS_DB, _EMPTY_METRICS, out["errors"], "metrics")
+    m, out["metrics_source"] = _metrics_conn(out["errors"])
     try:
         out["session"] = find_session(m, prefix, before)
     except sqlite3.Error as exc:
@@ -1762,7 +3060,7 @@ def router_roles() -> Dict[str, Any]:
 def topology_route(hours: int = Query(24, ge=1, le=168)) -> Dict[str, Any]:
     now = time.time()
     out: Dict[str, Any] = {"generated_at": now, "hours": hours, "errors": {}}
-    m = _ro_or_empty(_METRICS_DB, _EMPTY_METRICS, out["errors"], "metrics")
+    m, out["metrics_source"] = _metrics_conn(out["errors"])
     try:
         out.update(topology(m, now - hours * 3600, now))
     except sqlite3.Error as exc:
@@ -1857,7 +3155,7 @@ def activity_log(m: sqlite3.Connection, k: sqlite3.Connection, since: float, err
 def activity_route(hours: int = Query(24, ge=1, le=168)) -> Dict[str, Any]:
     now = time.time()
     out: Dict[str, Any] = {"generated_at": now, "hours": hours, "errors": {}}
-    m = _ro_or_empty(_METRICS_DB, _EMPTY_METRICS, out["errors"], "metrics")
+    m, out["metrics_source"] = _metrics_conn(out["errors"])
     k = _ro_or_empty(_KANBAN_DB, _EMPTY_KANBAN, out["errors"], "kanban")
     try:
         out.update(activity_log(m, k, now - hours * 3600, out["errors"]))
@@ -2039,7 +3337,7 @@ def handoffs(m: sqlite3.Connection, k: sqlite3.Connection, since: float, until: 
 def handoffs_route(hours: int = Query(168, ge=1, le=168), start: Optional[float] = None) -> Dict[str, Any]:
     since, until = _window(hours, start)
     out: Dict[str, Any] = {"generated_at": time.time(), "hours": hours, "start": start, "errors": {}}
-    m = _ro_or_empty(_METRICS_DB, _EMPTY_METRICS, out["errors"], "metrics")
+    m, out["metrics_source"] = _metrics_conn(out["errors"])
     k = _ro_or_empty(_KANBAN_DB, _EMPTY_KANBAN, out["errors"], "kanban")
     try:
         out.update(handoffs(m, k, since, until, out["errors"]))
@@ -2288,7 +3586,8 @@ def conformance() -> Dict[str, Any]:
     project = _standard_project() or None
     out: Dict[str, Any] = {"generated_at": time.time(), "project": project, "standard": None, "repo": None,
                            "host_rules": [], "hosts": None, "pipeline": None, "errors": errors,
-                           "org": org_mode() if BUSINESS_MODE else None, "local": False}
+                           "org": org_mode() if BUSINESS_MODE else None, "local": False,
+                           "metrics_source": metrics_source()[1]}
     # Optional feature: without a project there is nothing to check, which is not an error.
     if not project:
         return out
@@ -2325,13 +3624,15 @@ def conformance() -> Dict[str, Any]:
     out["check_examples"] = {r["check"].get("kind"): _flow(r["check"]) for r in reversed(used)}
     out["severities"] = sorted({str(r["severity"]) for r in used if r.get("severity")})
     try:
-        m = _ro(_METRICS_DB)
+        m, out["metrics_source"] = _metrics_conn(errors, "hosts")
         try:
-            out["hosts"] = host_results(m, std.get("hosts") or {}, out["generated_at"])
+            # No store to read is reported above, not served as "every host is stale".
+            if out["metrics_source"] != "none":
+                out["hosts"] = host_results(m, std.get("hosts") or {}, out["generated_at"])
         finally:
             m.close()
     except sqlite3.Error as exc:
-        errors["hosts"] = f"{_METRICS_DB} not found" if not _METRICS_DB.exists() else str(exc)
+        errors["hosts"] = str(exc)
     out["fixes"] = fix_states(_read_fixes(), out["hosts"] or [])
     if out["local"]:
         return out
@@ -2616,13 +3917,14 @@ def drift_card(host: str, profile: Optional[str]) -> Dict[str, Any]:
         raise HTTPException(400, f"no profile named {profile!r}")
     if profile and not _KANBAN_DB.exists():
         raise HTTPException(404, "no kanban board")
-    if not _METRICS_DB.exists():
-        raise HTTPException(404, "no metrics.db: host checks come from the metrics collector")
+    path, source = metrics_source()
+    if source == "none":
+        raise HTTPException(404, "no metrics store: host checks come from the metrics collector")
     try:
         std = safe_load(_standard_text(project)) or {}
     except (RuntimeError, urllib.error.URLError, OSError, ValueError, YAMLError) as exc:
         raise _gitlab_error(exc)
-    m = _ro(_METRICS_DB)
+    m = _ro(path)
     try:
         h = next((x for x in host_results(m, std.get("hosts") or {}, time.time()) if x["host"] == host), None)
     finally:
@@ -3189,7 +4491,11 @@ def setup() -> Dict[str, Any]:
     """What a first run still needs, for the setup checklist on the Overview page."""
     s, own = _settings(), _settings_in(load_config())
     action = s.get("drift_action") if s.get("drift_action") in DRIFT_ACTIONS else "button"
-    return {"profiles": profile_states(), "metrics": _METRICS_DB.exists(), "kanban": _KANBAN_DB.exists(),
+    source = metrics_source()[1]
+    return {"profiles": profile_states(), "metrics": source != "none",
+            "metrics_source": source, "kanban": _KANBAN_DB.exists(),
+            "metrics_dash": metrics_dash_probe(), "heartbeat": heartbeat_state(),
+            "storage": storage_report(),
             "conformance_project": _standard_project(),
             "gitlab": {**gitlab_state(), "sources": gitlab_sources()},
             "copy": plugin_copy(),
@@ -3245,3 +4551,48 @@ def setup_gitlab(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     _GITLAB_PROBE.update(at=0.0, host="", value=None)  # the login changed: probe it again
     return {"gitlab": gitlab_state(fresh=True), "wrote": ["gitlab_host", "gitlab_token"]}
 
+
+
+@router.get("/storage")
+def storage() -> Dict[str, Any]:
+    """Operations' own metrics store: what it holds, and what each retention keeps.
+
+    Everything here is about the plugin's OWN store (``<hermes root>/metrics/operations.db``); the
+    fleet ``metrics.db`` is never written and only read as a fallback. ``metrics_dash`` says
+    whether the metrics dashboard answered, with its revision and capabilities, and
+    ``heartbeat`` says whether the alert sweep is riding the dispatcher tick or this plugin's own
+    timer, so the page can tell which.
+    """
+    out = storage_report()
+    out["collector"] = source_state()
+    return out
+
+
+@router.post("/storage/retention")
+def set_retention(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """Set how long the own store keeps what it collects (30 / 60 / 90 / 0 = forever).
+
+    Written through Hermes' plugin-settings writer, like every other setting here, then the
+    collector prunes on its next pass. The answer is the same report GET /storage gives.
+    """
+    try:
+        days = int(body.get("days"))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "days must be one of 30, 60, 90 or 0 (forever)")
+    if days not in RETENTION_OPTIONS:
+        raise HTTPException(400, "days must be one of 30, 60, 90 or 0 (forever)")
+    try:
+        from hermes_cli.plugins_settings import save_plugin_settings
+    except ImportError as exc:  # an older Hermes: say so rather than writing config by hand
+        raise HTTPException(503, f"this Hermes cannot save plugin settings ({exc}); "
+                                 f"set plugins.entries.{ID}.settings.{RETENTION_SETTING} yourself")
+    plugin_dir = Path(__file__).resolve().parent.parent
+    try:
+        save_plugin_settings(ID, plugin_dir, {RETENTION_SETTING: days})
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except PermissionError as exc:
+        raise HTTPException(403, f"this profile's settings are managed elsewhere: {exc}")
+    out = storage_report()
+    out["wrote"] = [RETENTION_SETTING]
+    return out
